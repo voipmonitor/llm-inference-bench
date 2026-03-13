@@ -511,13 +511,18 @@ async def run_one_cell(
             state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
             state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
 
-            # Dynamic warmup: wait for min_warmup AND queue==0 (all reqs in decode)
+            # Dynamic warmup: wait for min_warmup AND queue==0 AND gen_throughput>0
+            # All three conditions ensure:
+            #   - CUDA graphs / JIT compiled (min_warmup)
+            #   - all requests past prefill (queue==0)
+            #   - server actually generating tokens (gen_throughput>0, catches JIT lag)
             if not warmup_done:
                 if elapsed >= min_warmup_seconds:
-                    if state.srv_queue_reqs == 0:
+                    server_ready = state.srv_queue_reqs == 0 and state.srv_gen_throughput > 0
+                    if server_ready:
                         if warmup_stable_since is None:
                             warmup_stable_since = now
-                        # Require 1s of stable queue==0 to avoid catching a transient dip
+                        # Require 1s of stable conditions to avoid transient dips
                         elif now - warmup_stable_since >= 1.0:
                             warmup_done = True
                             state.cell_warmup = False
@@ -681,11 +686,17 @@ def build_display(state: TUIState) -> Layout:
             )
         else:
             if state.cell_warmup:
-                # During ramp-up: show elapsed warmup time
+                # During ramp-up: show elapsed warmup time and why we're waiting
+                if state.srv_gen_throughput == 0:
+                    wait_reason = "waiting for gen_throughput > 0 (JIT compile?)"
+                elif state.srv_queue_reqs > 0:
+                    wait_reason = f"waiting for queue→0 (prefill ramp-up)"
+                else:
+                    wait_reason = "stabilizing..."
                 cell_text = (
                     f"[bold]DECODE[/bold]  C={state.current_concurrency}, ctx={format_context(state.current_context)}"
                     f"  [magenta]RAMP-UP[/magenta]\n"
-                    f"  Waiting for all {state.current_concurrency} reqs to prefill (queue→0)... {elapsed:.0f}s\n"
+                    f"  {wait_reason} {elapsed:.0f}s\n"
                     f"  Server: [bold yellow]{state.cell_live_tps:.1f}[/bold yellow] tok/s  "
                     f"running={state.srv_running_reqs} queue={state.srv_queue_reqs}\n"
                     f"  Test [bold]{state.completed_tests + 1}[/bold] of {state.total_tests}"
@@ -1042,7 +1053,7 @@ async def run_benchmark(args):
             state.cell_start = time.monotonic()
             live.update(build_display(state))
 
-            # Warmup 1: short decode (triggers decode CUDA graphs)
+            # Warmup 1: short decode (triggers decode CUDA graphs / JIT compilation)
             warmup_payload = {
                 "model": args.model,
                 "messages": [{"role": "user", "content": "Count from 1 to 20."}],
@@ -1052,7 +1063,7 @@ async def run_benchmark(args):
                 async with client.stream(
                     "POST", f"{base_url}/v1/chat/completions",
                     json=warmup_payload,
-                    timeout=httpx.Timeout(120.0, connect=30.0),
+                    timeout=httpx.Timeout(300.0, connect=30.0),
                 ) as resp:
                     async for line in resp.aiter_lines():
                         if line and line.startswith("data: [DONE]"):
