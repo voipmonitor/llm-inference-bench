@@ -8,6 +8,8 @@ Supports **SGLang** and **vLLM** engines (auto-detected).
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue)
 
+![screenshot](screenshot.png)
+
 ## Features
 
 - **Throughput matrix** — benchmarks every combination of concurrency (1, 2, 4, 8, ...) and context length (0K, 16K, 32K, 64K, 128K)
