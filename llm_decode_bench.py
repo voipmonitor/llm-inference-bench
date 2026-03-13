@@ -8,6 +8,7 @@ Auto-detects SGLang or vLLM engine and adapts metrics accordingly.
 Usage:
     python3 llm_decode_bench.py
     python3 llm_decode_bench.py --port 5199 --concurrency 1,2,4 --contexts 0,16384
+    python3 llm_decode_bench.py --port 5199 --kv-budget 692736
     python3 llm_decode_bench.py --port 5001 --max-tokens 4096
 """
 
@@ -429,6 +430,26 @@ async def run_one_cell(
     state.cell_running = True
     state.cell_warmup = True
 
+    # Scout request: ensure prefix cache is warm before launching full concurrency.
+    # Send one request with max_tokens=1 to populate/refresh prefix cache,
+    # then all C requests will get cache hits instead of competing for prefill.
+    if context_tokens > 0:
+        scout_payload = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": 1,
+        }
+        try:
+            async with client.stream("POST", url, json=scout_payload,
+                                     timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
+                async for line in resp.aiter_lines():
+                    if line and line.startswith("data: [DONE]"):
+                        break
+        except Exception:
+            pass
+        live.update(build_display(state))
+
     # Launch all streams
     tasks = [
         asyncio.create_task(
@@ -808,6 +829,11 @@ async def run_benchmark(args):
     base_url = f"http://{args.host}:{args.port}"
     console = Console()
 
+    # --kv-budget overrides --max-total-tokens
+    if args.kv_budget > 0:
+        args.max_total_tokens = args.kv_budget
+        console.print(f"[cyan]KV cache budget (manual):[/cyan] {args.max_total_tokens:,} tokens")
+
     # --- Step 1: Connect to server, detect engine, and read limits ---
     server_context_length = 0
     max_running = None
@@ -888,25 +914,13 @@ async def run_benchmark(args):
                 except Exception:
                     console.print(f"[yellow]Could not detect engine. Assuming SGLang.[/yellow]  Models: {model_ids}")
 
-        # vLLM: get KV budget from cache_config_info metric labels
+        # vLLM: KV budget cannot be reliably derived from metrics (block_size includes
+        # non-KV state for MoE/hybrid models). Rely on --kv-budget or queue detection.
         if engine == ENGINE_VLLM and args.max_total_tokens == 0:
-            try:
-                resp = await check_client.get(f"{base_url}/metrics", timeout=5.0)
-                metrics_text = resp.text
-                # Parse cache_config_info labels for num_gpu_blocks and block_size
-                for line in metrics_text.splitlines():
-                    if line.startswith("vllm:cache_config_info{"):
-                        m_blocks = re.search(r'num_gpu_blocks="(\d+)"', line)
-                        m_bsize = re.search(r'block_size="(\d+)"', line)
-                        if m_blocks and m_bsize:
-                            num_blocks = int(m_blocks.group(1))
-                            block_size = int(m_bsize.group(1))
-                            if num_blocks > 0:
-                                args.max_total_tokens = num_blocks * block_size
-                                console.print(f"[cyan]KV cache budget:[/cyan] {args.max_total_tokens:,} tokens ({num_blocks} blocks × {block_size})")
-                        break
-            except Exception:
-                pass
+            console.print(
+                "[yellow]vLLM: KV cache budget not available from metrics. "
+                "Use --kv-budget to skip over-capacity cells, or rely on queue detection.[/yellow]"
+            )
 
         # Handle max_running_requests
         if max_running:
@@ -1370,6 +1384,12 @@ def parse_args():
         "--max-total-tokens", type=int, default=0,
         help="Max total tokens budget (concurrency × (context + max_tokens)). "
              "Cells exceeding this are skipped. 0 = no limit (default: 0)"
+    )
+    parser.add_argument(
+        "--kv-budget", type=int, default=0,
+        help="KV cache budget in tokens. Overrides auto-detection. "
+             "Cells where concurrency × (context + max_tokens) > budget are skipped. "
+             "Use this for vLLM where auto-detection is unreliable. (default: 0 = auto-detect)"
     )
     return parser.parse_args()
 
