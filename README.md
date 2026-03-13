@@ -17,6 +17,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected).
 - **Live TUI dashboard** — real-time progress, per-cell results, and aggregate stats via [Rich](https://github.com/Textualize/rich)
 - **Prefill measurement** — separate TTFT measurement for large context prefill
 - **JSON output** — structured results saved to `benchmark_results.json` for further analysis
+- **Smart test skipping** — reads KV cache budget and `max_running_requests` from the server at startup, automatically skips combinations where `concurrency × (context + max_tokens)` would exceed available KV cache — these would just queue anyway, so there's no point measuring them
 - **Engine auto-detection** — automatically detects SGLang vs vLLM and adapts metric scraping
 
 ## Installation
