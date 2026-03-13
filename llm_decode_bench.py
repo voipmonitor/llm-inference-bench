@@ -106,6 +106,12 @@ class CellResult:
     server_gen_throughput: float = 0.0
     server_utilization: float = 0.0
     server_spec_accept_rate: float = 0.0
+    # Queue / effective concurrency tracking
+    avg_running_reqs: float = 0.0
+    max_running_reqs: int = 0
+    avg_queue_reqs: float = 0.0
+    max_queue_reqs: int = 0
+    queue_fraction: float = 0.0  # fraction of samples where queue > 0
 
 
 @dataclass
@@ -125,6 +131,8 @@ class TUIState:
     cell_tokens: int = 0
     cell_live_tps: float = 0.0
     cell_running: bool = False
+    cell_warmup: bool = False  # True during prefill ramp-up before measurement
+    cell_measurement_start: float = 0.0  # when actual measurement begins (after warmup)
     # Server metrics
     srv_gen_throughput: float = 0.0
     srv_running_reqs: int = 0
@@ -135,6 +143,7 @@ class TUIState:
     # Results
     results: dict = field(default_factory=dict)  # (ctx, conc) -> aggregate_tps
     errors: dict = field(default_factory=dict)   # (ctx, conc) -> num_errors
+    queue_info: dict = field(default_factory=dict)  # (ctx, conc) -> (avg_running, avg_queue)
     concurrency_levels: list = field(default_factory=list)
     context_lengths: list = field(default_factory=list)
     # Prefill results: ctx -> {ttft, tok_per_sec}
@@ -418,6 +427,7 @@ async def run_one_cell(
     state.cell_tokens = 0
     state.cell_live_tps = 0.0
     state.cell_running = True
+    state.cell_warmup = True
 
     # Launch all streams
     tasks = [
@@ -429,12 +439,20 @@ async def run_one_cell(
 
     # Monitor loop — collect server gen_throughput samples for accurate measurement
     metrics_interval = 1.0
-    warmup_seconds = 4.0  # skip early samples (CUDA graph warmup)
+    min_warmup_seconds = 2.0   # minimum warmup (CUDA graph etc.)
+    max_warmup_seconds = 60.0  # give up waiting for queue to drain
     last_metrics_time = 0.0
     gen_throughput_samples = []
     # For vLLM: compute throughput rate from generation_tokens counter
     prev_gen_tokens = None
     prev_gen_time = None
+    # Queue tracking: collect running/queue samples after warmup
+    running_reqs_samples = []
+    queue_reqs_samples = []
+    # Dynamic warmup: wait until all requests are in decode (queue == 0)
+    warmup_done = False
+    warmup_stable_since = None  # time when queue first hit 0 after min_warmup
+    measurement_start = None    # reset timer after warmup for full duration measurement
 
     while True:
         await asyncio.sleep(0.5)
@@ -471,9 +489,34 @@ async def run_one_cell(
             state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
             state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
             state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
-            # Collect gen_throughput samples after warmup (skip ramp-up period)
-            if state.srv_gen_throughput > 0 and elapsed > warmup_seconds:
-                gen_throughput_samples.append(state.srv_gen_throughput)
+
+            # Dynamic warmup: wait for min_warmup AND queue==0 (all reqs in decode)
+            if not warmup_done:
+                if elapsed >= min_warmup_seconds:
+                    if state.srv_queue_reqs == 0:
+                        if warmup_stable_since is None:
+                            warmup_stable_since = now
+                        # Require 1s of stable queue==0 to avoid catching a transient dip
+                        elif now - warmup_stable_since >= 1.0:
+                            warmup_done = True
+                            state.cell_warmup = False
+                            measurement_start = now
+                            state.cell_measurement_start = now
+                    else:
+                        warmup_stable_since = None
+                    # Give up after max_warmup — queue never drained (real capacity issue)
+                    if elapsed >= max_warmup_seconds:
+                        warmup_done = True
+                        state.cell_warmup = False
+                        measurement_start = now
+                        state.cell_measurement_start = now
+
+            # Collect samples only after warmup is done
+            if warmup_done:
+                if state.srv_gen_throughput > 0:
+                    gen_throughput_samples.append(state.srv_gen_throughput)
+                running_reqs_samples.append(state.srv_running_reqs)
+                queue_reqs_samples.append(state.srv_queue_reqs)
             last_metrics_time = now
 
         # Use server gen_throughput for live display
@@ -482,8 +525,9 @@ async def run_one_cell(
         # Update TUI
         live.update(build_display(state))
 
-        # Check duration
-        if elapsed >= duration:
+        # Check duration (measured from after warmup completes)
+        measure_elapsed = (now - measurement_start) if measurement_start else 0
+        if measurement_start and measure_elapsed >= duration:
             cancel_event.set()
             break
 
@@ -531,6 +575,14 @@ async def run_one_cell(
     per_req_tps = avg_gen_throughput / concurrency if concurrency > 0 else 0.0
     ttfts = [r.ttft for r in successful if r.ttft > 0]
 
+    # Queue stats
+    avg_running = mean(running_reqs_samples) if running_reqs_samples else 0.0
+    max_running = max(running_reqs_samples) if running_reqs_samples else 0
+    avg_queue = mean(queue_reqs_samples) if queue_reqs_samples else 0.0
+    max_queue = max(queue_reqs_samples) if queue_reqs_samples else 0
+    queued_count = sum(1 for q in queue_reqs_samples if q > 0)
+    queue_frac = queued_count / len(queue_reqs_samples) if queue_reqs_samples else 0.0
+
     cell = CellResult(
         concurrency=concurrency,
         context_tokens=context_tokens,
@@ -546,11 +598,17 @@ async def run_one_cell(
         server_gen_throughput=avg_gen_throughput,
         server_utilization=extract_metric(metrics, metric_name(engine, "utilization")),
         server_spec_accept_rate=extract_metric(metrics, metric_name(engine, "spec_accept_rate")),
+        avg_running_reqs=round(avg_running, 1),
+        max_running_reqs=max_running,
+        avg_queue_reqs=round(avg_queue, 1),
+        max_queue_reqs=max_queue,
+        queue_fraction=round(queue_frac, 3),
     )
 
     state.cell_running = False
     state.results[(context_tokens, concurrency)] = cell.aggregate_tps
     state.errors[(context_tokens, concurrency)] = cell.num_errors
+    state.queue_info[(context_tokens, concurrency)] = (cell.avg_running_reqs, cell.avg_queue_reqs)
 
     return cell
 
@@ -601,17 +659,30 @@ def build_display(state: TUIState) -> Layout:
                 f"  Test [bold]{state.completed_tests + 1}[/bold] of {state.total_tests}"
             )
         else:
-            pct = min(elapsed / state.cell_duration, 1.0) if state.cell_duration > 0 else 0
-            bar_width = 30
-            filled = int(pct * bar_width)
-            bar = "[green]" + "=" * filled + ">" + "[/green]" + " " * (bar_width - filled - 1)
+            if state.cell_warmup:
+                # During ramp-up: show elapsed warmup time
+                cell_text = (
+                    f"[bold]DECODE[/bold]  C={state.current_concurrency}, ctx={format_context(state.current_context)}"
+                    f"  [magenta]RAMP-UP[/magenta]\n"
+                    f"  Waiting for all {state.current_concurrency} reqs to prefill (queue→0)... {elapsed:.0f}s\n"
+                    f"  Server: [bold yellow]{state.cell_live_tps:.1f}[/bold yellow] tok/s  "
+                    f"running={state.srv_running_reqs} queue={state.srv_queue_reqs}\n"
+                    f"  Test [bold]{state.completed_tests + 1}[/bold] of {state.total_tests}"
+                )
+            else:
+                # Measurement phase: progress bar from measurement_start
+                measure_elapsed = (time.monotonic() - state.cell_measurement_start) if state.cell_measurement_start > 0 else elapsed
+                pct = min(measure_elapsed / state.cell_duration, 1.0) if state.cell_duration > 0 else 0
+                bar_width = 30
+                filled = int(pct * bar_width)
+                bar = "[green]" + "=" * filled + ">" + "[/green]" + " " * (bar_width - filled - 1)
 
-            cell_text = (
-                f"[bold]DECODE[/bold]  C={state.current_concurrency}, ctx={format_context(state.current_context)}\n"
-                f"  [{bar}] {elapsed:.0f}/{state.cell_duration:.0f}s\n"
-                f"  Server: [bold yellow]{state.cell_live_tps:.1f}[/bold yellow] tok/s ({state.engine} throughput)\n"
-                f"  Test [bold]{state.completed_tests + 1}[/bold] of {state.total_tests}"
-            )
+                cell_text = (
+                    f"[bold]DECODE[/bold]  C={state.current_concurrency}, ctx={format_context(state.current_context)}\n"
+                    f"  [{bar}] {measure_elapsed:.0f}/{state.cell_duration:.0f}s\n"
+                    f"  Server: [bold yellow]{state.cell_live_tps:.1f}[/bold yellow] tok/s ({state.engine} throughput)\n"
+                    f"  Test [bold]{state.completed_tests + 1}[/bold] of {state.total_tests}"
+                )
     else:
         cell_text = "[dim]Waiting...[/dim]"
     layout["current_test"].update(Panel(cell_text, title="Current Test", border_style="cyan"))
@@ -632,7 +703,7 @@ def build_display(state: TUIState) -> Layout:
     results_table = Table(title="Aggregate Throughput (tok/s)", border_style="green", expand=True)
     results_table.add_column("ctx \\ conc", style="bold cyan", min_width=8)
     for conc in state.concurrency_levels:
-        results_table.add_column(str(conc), justify="right", min_width=7)
+        results_table.add_column(str(conc), justify="right", min_width=10)
 
     # Determine color thresholds from existing results (exclude skipped=-1)
     all_values = [v for v in state.results.values() if v > 0]
@@ -662,6 +733,11 @@ def build_display(state: TUIState) -> Layout:
                 cell = f"{val:.1f}"
                 if errs > 0:
                     cell += f" [red]({errs}e)[/red]"
+                # Show queue indicator: avg_running/conc when queuing detected
+                qi = state.queue_info.get(key)
+                if qi and qi[1] > 0:
+                    avg_run, avg_q = qi
+                    cell += f" [magenta]({avg_run:.0f}/{conc})[/magenta]"
                 row.append(f"[{style}]{cell}[/{style}]")
             else:
                 row.append("[dim]...[/dim]")
@@ -1146,6 +1222,8 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         table.add_column(str(conc), justify="right")
 
     result_map = {(r.context_tokens, r.concurrency): r for r in results}
+    any_queued = any(r.avg_queue_reqs > 0 for r in results if r.aggregate_tps >= 0)
+
     for ctx in context_lengths:
         row = [format_context(ctx)]
         for conc in concurrency_levels:
@@ -1156,12 +1234,16 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 val = f"{r.aggregate_tps:.1f}"
                 if r.num_errors > 0:
                     val += f" ({r.num_errors}e)"
+                if r.avg_queue_reqs > 0:
+                    val += f" ({r.avg_running_reqs:.0f}/{conc})"
                 row.append(val)
             else:
                 row.append("-")
         table.add_row(*row)
 
     console.print(table)
+    if any_queued:
+        console.print("[dim](X/Y) = avg running / requested concurrency — requests were queued[/dim]")
 
     # Per-request avg tok/s table
     table2 = Table(title="Per-Request Avg Throughput (tok/s)", border_style="blue")
@@ -1176,7 +1258,10 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
             if r and r.aggregate_tps < 0:
                 row.append("skip")
             elif r and r.per_request_avg_tps > 0:
-                row.append(f"{r.per_request_avg_tps:.1f}")
+                val = f"{r.per_request_avg_tps:.1f}"
+                if r.avg_queue_reqs > 0:
+                    val += f" ({r.avg_running_reqs:.0f}/{conc})"
+                row.append(val)
             else:
                 row.append("-")
         table2.add_row(*row)
