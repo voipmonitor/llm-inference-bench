@@ -769,6 +769,24 @@ async def run_benchmark(args):
                 if max_running:
                     max_running = int(max_running)
                 server_context_length = server_info.get("context_length") or server_context_length
+                # Verify that --enable-metrics is active
+                try:
+                    metrics_resp = await check_client.get(f"{base_url}/metrics", timeout=5.0)
+                    if "sglang:" not in metrics_resp.text[:2000]:
+                        console.print(
+                            "[bold red]ERROR: SGLang server does not have metrics enabled.[/bold red]\n"
+                            "This benchmark requires Prometheus metrics for accurate server-side throughput measurement.\n"
+                            "Restart SGLang with [bold]--enable-metrics[/bold] flag.\n\n"
+                            "Example:\n"
+                            "  python -m sglang.launch_server --model ... --enable-metrics"
+                        )
+                        sys.exit(1)
+                except httpx.HTTPError:
+                    console.print(
+                        "[bold red]ERROR: Cannot reach SGLang /metrics endpoint.[/bold red]\n"
+                        "Restart SGLang with [bold]--enable-metrics[/bold] flag."
+                    )
+                    sys.exit(1)
             else:
                 raise ValueError("Not SGLang")
         except Exception:
