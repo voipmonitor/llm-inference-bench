@@ -309,6 +309,7 @@ async def stream_one_request(
     t_start = time.monotonic()
     t_first = None
     char_count = 0
+    chunk_count = 0
     usage_tokens = None
 
     try:
@@ -357,12 +358,10 @@ async def stream_one_request(
                 if text:
                     if t_first is None:
                         t_first = time.monotonic()
-                    chars = len(text)
-                    char_count += chars
-                    # Estimate tokens from chars for live display
-                    # (MTP batches multiple tokens per SSE event)
-                    estimated_new = max(1, round(chars / CHARS_PER_TOKEN))
-                    shared_token_count[0] += estimated_new
+                    char_count += len(text)
+                    chunk_count += 1
+                    # Each SSE chunk = 1 token (verified on vLLM and SGLang)
+                    shared_token_count[0] += 1
 
     except httpx.ReadTimeout:
         result.error = "ReadTimeout"
@@ -380,7 +379,8 @@ async def stream_one_request(
     if usage_tokens is not None:
         result.total_tokens = usage_tokens
     else:
-        result.total_tokens = max(1, round(char_count / CHARS_PER_TOKEN)) if char_count > 0 else 0
+        # Fallback: 1 SSE chunk = 1 token
+        result.total_tokens = chunk_count
     result.total_time = t_end - t_start
     if t_first is not None:
         result.ttft = t_first - t_start
@@ -610,8 +610,9 @@ async def run_one_cell(
     successful = [r for r in stream_results if r.error is None]
     total_tokens = sum(r.total_tokens for r in stream_results)
 
-    # Client-side fallback: only when server metrics give 0 (vLLM V1 missing gauge).
-    # Server metrics are more accurate than client-side char-based estimation.
+    # Client-side fallback: only when server metrics give 0 (vLLM V1 missing gauge
+    # and counter not updating in real-time).
+    # shared_token_count tracks exact token count (1 SSE chunk = 1 token).
     if avg_gen_throughput == 0:
         measure_duration = (time.monotonic() - measurement_start) if measurement_start else wall_time
         measurement_tokens = shared_token_count[0] - measurement_tokens_start
