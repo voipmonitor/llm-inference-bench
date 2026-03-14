@@ -474,6 +474,7 @@ async def run_one_cell(
     warmup_done = False
     warmup_stable_since = None  # time when queue first hit 0 after min_warmup
     measurement_start = None    # reset timer after warmup for full duration measurement
+    measurement_tokens_start = 0  # token count at measurement start (for client-side fallback)
 
     while True:
         await asyncio.sleep(0.5)
@@ -528,6 +529,7 @@ async def run_one_cell(
                             state.cell_warmup = False
                             measurement_start = now
                             state.cell_measurement_start = now
+                            measurement_tokens_start = shared_token_count[0]
                     else:
                         warmup_stable_since = None
                     # Give up after max_warmup — queue never drained (real capacity issue)
@@ -536,6 +538,7 @@ async def run_one_cell(
                         state.cell_warmup = False
                         measurement_start = now
                         state.cell_measurement_start = now
+                        measurement_tokens_start = shared_token_count[0]
 
             # Collect samples only after warmup is done
             if warmup_done:
@@ -545,8 +548,14 @@ async def run_one_cell(
                 queue_reqs_samples.append(state.srv_queue_reqs)
             last_metrics_time = now
 
-        # Use server gen_throughput for live display
-        state.cell_live_tps = state.srv_gen_throughput
+        # Use server gen_throughput for live display; fall back to client-side estimate
+        if state.srv_gen_throughput > 0:
+            state.cell_live_tps = state.srv_gen_throughput
+        elif measurement_start:
+            client_elapsed = now - measurement_start
+            measurement_tokens = shared_token_count[0] - measurement_tokens_start
+            if client_elapsed > 0.5 and measurement_tokens > 0:
+                state.cell_live_tps = measurement_tokens / client_elapsed
 
         # Update TUI
         live.update(build_display(state))
@@ -597,7 +606,18 @@ async def run_one_cell(
     # Client-side stats
     successful = [r for r in stream_results if r.error is None]
     total_tokens = sum(r.total_tokens for r in stream_results)
-    # Derive per-request from server metric for consistency (aggregate / concurrency)
+
+    # Fallback: if server metrics gave no usable throughput, use client-side token count.
+    # This handles vLLM V1 where gen_throughput gauge is missing and the token counter
+    # only updates on request completion.
+    if avg_gen_throughput == 0 and total_tokens > 0:
+        measure_duration = (time.monotonic() - measurement_start) if measurement_start else wall_time
+        # Use only tokens generated during measurement period (exclude warmup tokens)
+        measurement_tokens = shared_token_count[0] - measurement_tokens_start
+        if measure_duration > 0 and measurement_tokens > 0:
+            avg_gen_throughput = measurement_tokens / measure_duration
+
+    # Derive per-request from aggregate for consistency
     per_req_tps = avg_gen_throughput / concurrency if concurrency > 0 else 0.0
     ttfts = [r.ttft for r in successful if r.ttft > 0]
 
@@ -621,7 +641,7 @@ async def run_one_cell(
         wall_time=wall_time,
         num_completed=len(successful),
         num_errors=len(stream_results) - len(successful),
-        server_gen_throughput=avg_gen_throughput,
+        server_gen_throughput=median(gen_throughput_samples) if gen_throughput_samples else 0.0,
         server_utilization=extract_metric(metrics, metric_name(engine, "utilization")),
         server_spec_accept_rate=extract_metric(metrics, metric_name(engine, "spec_accept_rate")),
         avg_running_reqs=round(avg_running, 1),
