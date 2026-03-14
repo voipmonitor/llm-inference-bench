@@ -512,14 +512,17 @@ async def run_one_cell(
             state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
             state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
 
-            # Dynamic warmup: wait for min_warmup AND queue==0 AND gen_throughput>0
+            # Dynamic warmup: wait for min_warmup AND queue==0 AND tokens flowing
             # All three conditions ensure:
             #   - CUDA graphs / JIT compiled (min_warmup)
             #   - all requests past prefill (queue==0)
-            #   - server actually generating tokens (gen_throughput>0, catches JIT lag)
+            #   - tokens actually being generated (server OR client-side detection)
             if not warmup_done:
                 if elapsed >= min_warmup_seconds:
-                    server_ready = state.srv_queue_reqs == 0 and state.srv_gen_throughput > 0
+                    # Accept server gen_throughput OR client-side token generation
+                    # (vLLM V1 doesn't expose gen_throughput gauge)
+                    generating = state.srv_gen_throughput > 0 or shared_token_count[0] > 0
+                    server_ready = state.srv_queue_reqs == 0 and generating
                     if server_ready:
                         if warmup_stable_since is None:
                             warmup_stable_since = now
@@ -607,15 +610,15 @@ async def run_one_cell(
     successful = [r for r in stream_results if r.error is None]
     total_tokens = sum(r.total_tokens for r in stream_results)
 
-    # Fallback: if server metrics gave no usable throughput, use client-side token count.
-    # This handles vLLM V1 where gen_throughput gauge is missing and the token counter
-    # only updates on request completion.
-    if avg_gen_throughput == 0 and total_tokens > 0:
-        measure_duration = (time.monotonic() - measurement_start) if measurement_start else wall_time
-        # Use only tokens generated during measurement period (exclude warmup tokens)
-        measurement_tokens = shared_token_count[0] - measurement_tokens_start
-        if measure_duration > 0 and measurement_tokens > 0:
-            avg_gen_throughput = measurement_tokens / measure_duration
+    # Client-side throughput from SSE token counting (measurement period only).
+    # Use max(server, client) because vLLM V1's gen_tokens counter can under-report
+    # (bursty updates, off-by-one in running count → wrong rate).
+    client_gen_throughput = 0.0
+    measure_duration = (time.monotonic() - measurement_start) if measurement_start else wall_time
+    measurement_tokens = shared_token_count[0] - measurement_tokens_start
+    if measure_duration > 0 and measurement_tokens > 0:
+        client_gen_throughput = measurement_tokens / measure_duration
+    avg_gen_throughput = max(avg_gen_throughput, client_gen_throughput)
 
     # Derive per-request from aggregate for consistency
     per_req_tps = avg_gen_throughput / concurrency if concurrency > 0 else 0.0
@@ -707,8 +710,8 @@ def build_display(state: TUIState) -> Layout:
         else:
             if state.cell_warmup:
                 # During ramp-up: show elapsed warmup time and why we're waiting
-                if state.srv_gen_throughput == 0:
-                    wait_reason = "waiting for gen_throughput > 0 (JIT compile?)"
+                if state.srv_gen_throughput == 0 and state.cell_tokens == 0:
+                    wait_reason = "waiting for token generation (JIT compile?)"
                 elif state.srv_queue_reqs > 0:
                     wait_reason = f"waiting for queue→0 (prefill ramp-up)"
                 else:
