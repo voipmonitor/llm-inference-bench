@@ -610,15 +610,13 @@ async def run_one_cell(
     successful = [r for r in stream_results if r.error is None]
     total_tokens = sum(r.total_tokens for r in stream_results)
 
-    # Client-side throughput from SSE token counting (measurement period only).
-    # Use max(server, client) because vLLM V1's gen_tokens counter can under-report
-    # (bursty updates, off-by-one in running count → wrong rate).
-    client_gen_throughput = 0.0
-    measure_duration = (time.monotonic() - measurement_start) if measurement_start else wall_time
-    measurement_tokens = shared_token_count[0] - measurement_tokens_start
-    if measure_duration > 0 and measurement_tokens > 0:
-        client_gen_throughput = measurement_tokens / measure_duration
-    avg_gen_throughput = max(avg_gen_throughput, client_gen_throughput)
+    # Client-side fallback: only when server metrics give 0 (vLLM V1 missing gauge).
+    # Server metrics are more accurate than client-side char-based estimation.
+    if avg_gen_throughput == 0:
+        measure_duration = (time.monotonic() - measurement_start) if measurement_start else wall_time
+        measurement_tokens = shared_token_count[0] - measurement_tokens_start
+        if measure_duration > 0 and measurement_tokens > 0:
+            avg_gen_throughput = measurement_tokens / measure_duration
 
     # Derive per-request from aggregate for consistency
     per_req_tps = avg_gen_throughput / concurrency if concurrency > 0 else 0.0
