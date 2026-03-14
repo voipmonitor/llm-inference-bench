@@ -304,6 +304,7 @@ async def stream_one_request(
     index: int,
     cancel_event: asyncio.Event,
     shared_token_count: list,
+    shared_active_streams: list = None,
 ) -> StreamResult:
     result = StreamResult()
     t_start = time.monotonic()
@@ -358,6 +359,8 @@ async def stream_one_request(
                 if text:
                     if t_first is None:
                         t_first = time.monotonic()
+                        if shared_active_streams is not None:
+                            shared_active_streams[0] += 1
                     char_count += len(text)
                     chunk_count += 1
                     # Each SSE chunk = 1 token (verified on vLLM and SGLang)
@@ -419,6 +422,7 @@ async def run_one_cell(
     url = f"{base_url}/v1/chat/completions"
     cancel_event = asyncio.Event()
     shared_token_count = [0]
+    shared_active_streams = [0]  # how many streams have received first token
 
     # Fresh client per cell — avoids stale keepalive connections from previous cells
     cell_limits = httpx.Limits(
@@ -460,7 +464,8 @@ async def run_one_cell(
     # Launch all streams on fresh client (no stale keepalive connections)
     tasks = [
         asyncio.create_task(
-            stream_one_request(cell_client, url, payload, i, cancel_event, shared_token_count)
+            stream_one_request(cell_client, url, payload, i, cancel_event,
+                               shared_token_count, shared_active_streams)
         )
         for i in range(concurrency)
     ]
@@ -490,6 +495,7 @@ async def run_one_cell(
 
         # Update token counts from client-side estimate (for TUI only)
         state.cell_tokens = shared_token_count[0]
+        state._active_streams = shared_active_streams[0]
 
         # Scrape server metrics periodically
         if now - last_metrics_time > metrics_interval:
@@ -526,10 +532,11 @@ async def run_one_cell(
             #   - tokens actually being generated (server OR client-side detection)
             if not warmup_done:
                 if elapsed >= min_warmup_seconds:
-                    # Accept server gen_throughput OR client-side token generation
-                    # (vLLM V1 doesn't expose gen_throughput gauge)
+                    # All streams must have received their first token before measurement.
+                    # This prevents measuring before slow-to-prefill requests start decoding.
+                    all_streams_active = shared_active_streams[0] >= concurrency
                     generating = state.srv_gen_throughput > 0 or shared_token_count[0] > 0
-                    server_ready = state.srv_queue_reqs == 0 and generating
+                    server_ready = state.srv_queue_reqs == 0 and generating and all_streams_active
                     if server_ready:
                         if warmup_stable_since is None:
                             warmup_stable_since = now
@@ -720,7 +727,9 @@ def build_display(state: TUIState) -> Layout:
                 if state.srv_gen_throughput == 0 and state.cell_tokens == 0:
                     wait_reason = "waiting for token generation (JIT compile?)"
                 elif state.srv_queue_reqs > 0:
-                    wait_reason = f"waiting for queue→0 (prefill ramp-up)"
+                    wait_reason = "waiting for queue→0 (prefill ramp-up)"
+                elif hasattr(state, '_active_streams') and state._active_streams < state.current_concurrency:
+                    wait_reason = f"waiting for all streams ({state._active_streams}/{state.current_concurrency})"
                 else:
                     wait_reason = "stabilizing..."
                 cell_text = (
