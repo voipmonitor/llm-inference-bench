@@ -795,9 +795,9 @@ def build_display(state: TUIState) -> Layout:
                 cell = f"{val:.1f}"
                 if errs > 0:
                     cell += f" [red]({errs}e)[/red]"
-                # Show running/requested when not at full concurrency
+                # Show running/requested when queuing detected
                 qi = state.queue_info.get(key)
-                if qi and qi[0] < conc:
+                if qi and qi[1] > 0:
                     avg_run, avg_q = qi
                     cell += f" [magenta]({avg_run:.0f}/{conc})[/magenta]"
                 row.append(f"[{style}]{cell}[/{style}]")
@@ -1277,7 +1277,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         table.add_column(str(conc), justify="right")
 
     result_map = {(r.context_tokens, r.concurrency): r for r in results}
-    any_partial = any(r.avg_running_reqs < r.concurrency for r in results if r.aggregate_tps >= 0)
+    any_queued = any(r.avg_queue_reqs > 0 for r in results if r.aggregate_tps >= 0)
 
     for ctx in context_lengths:
         row = [format_context(ctx)]
@@ -1289,7 +1289,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 val = f"{r.aggregate_tps:.1f}"
                 if r.num_errors > 0:
                     val += f" ({r.num_errors}e)"
-                if r.avg_running_reqs < conc:
+                if r.avg_queue_reqs > 0:
                     val += f" ({r.avg_running_reqs:.0f}/{conc})"
                 row.append(val)
             else:
@@ -1297,8 +1297,8 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         table.add_row(*row)
 
     console.print(table)
-    if any_partial:
-        console.print("[dim](X/Y) = avg running / requested concurrency — server did not run all requests[/dim]")
+    if any_queued:
+        console.print("[dim](X/Y) = avg running / requested concurrency — requests were queued[/dim]")
 
     # Per-request avg tok/s table
     table2 = Table(title="Per-Request Avg Throughput (tok/s)", border_style="blue")
@@ -1314,7 +1314,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 row.append("skip")
             elif r and r.per_request_avg_tps > 0:
                 val = f"{r.per_request_avg_tps:.1f}"
-                if r.avg_running_reqs < conc:
+                if r.avg_queue_reqs > 0:
                     val += f" ({r.avg_running_reqs:.0f}/{conc})"
                 row.append(val)
             else:
