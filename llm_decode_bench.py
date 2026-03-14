@@ -420,6 +420,13 @@ async def run_one_cell(
     cancel_event = asyncio.Event()
     shared_token_count = [0]
 
+    # Fresh client per cell — avoids stale keepalive connections from previous cells
+    cell_limits = httpx.Limits(
+        max_connections=concurrency + 10,
+        max_keepalive_connections=concurrency + 5,
+    )
+    cell_client = httpx.AsyncClient(limits=cell_limits)
+
     # Update TUI state
     state.current_concurrency = concurrency
     state.current_context = context_tokens
@@ -450,15 +457,13 @@ async def run_one_cell(
             pass
         live.update(build_display(state))
 
-    # Launch all streams — stagger to ensure each HTTP connection establishes
-    tasks = []
-    for i in range(concurrency):
-        tasks.append(asyncio.create_task(
-            stream_one_request(client, url, payload, i, cancel_event, shared_token_count)
-        ))
-        await asyncio.sleep(0.1)  # 100ms between each to avoid connection race
-    # Wait for all connections to fully establish
-    await asyncio.sleep(1.0)
+    # Launch all streams on fresh client (no stale keepalive connections)
+    tasks = [
+        asyncio.create_task(
+            stream_one_request(cell_client, url, payload, i, cancel_event, shared_token_count)
+        )
+        for i in range(concurrency)
+    ]
 
     # Monitor loop — collect server gen_throughput samples for accurate measurement
     metrics_interval = 1.0
@@ -660,6 +665,7 @@ async def run_one_cell(
     state.errors[(context_tokens, concurrency)] = cell.num_errors
     state.queue_info[(context_tokens, concurrency)] = (cell.avg_running_reqs, cell.avg_queue_reqs)
 
+    await cell_client.aclose()
     return cell
 
 
