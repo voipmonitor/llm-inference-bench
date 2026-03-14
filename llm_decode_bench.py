@@ -450,13 +450,15 @@ async def run_one_cell(
             pass
         live.update(build_display(state))
 
-    # Launch all streams
-    tasks = [
-        asyncio.create_task(
+    # Launch all streams — stagger to ensure each HTTP connection establishes
+    tasks = []
+    for i in range(concurrency):
+        tasks.append(asyncio.create_task(
             stream_one_request(client, url, payload, i, cancel_event, shared_token_count)
-        )
-        for i in range(concurrency)
-    ]
+        ))
+        await asyncio.sleep(0.1)  # 100ms between each to avoid connection race
+    # Wait for all connections to fully establish
+    await asyncio.sleep(1.0)
 
     # Monitor loop — collect server gen_throughput samples for accurate measurement
     metrics_interval = 1.0
