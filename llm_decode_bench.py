@@ -1037,7 +1037,10 @@ async def run_benchmark(args):
                 if conc * (ctx + args.max_tokens) > args.max_total_tokens:
                     state.results[(ctx, conc)] = -1
 
-    # Add prefill tests to total count
+    # Add prefill tests to total count (unless skipped)
+    if args.skip_prefill:
+        prefill_contexts = []
+        state.prefill_contexts = []
     state.total_tests += len(prefill_contexts)
 
     # Run benchmark
@@ -1083,35 +1086,33 @@ async def run_benchmark(args):
         with Live(build_display(state), refresh_per_second=2, console=console) as live:
 
             # === Phase 1: Prefill benchmark (C=1, max_tokens=1) ===
-            # Warmup: trigger CUDA graph compilation before measurements.
-            # First request with context triggers chunked prefill graph capture
-            # (can take 10+ seconds without warmup, corrupting the 8k measurement).
-            state.prefill_phase = True
-            state.current_context = 0
-            state.cell_running = True
-            state.cell_start = time.monotonic()
-            live.update(build_display(state))
-
-            # Warmup 1: short decode (triggers decode CUDA graphs / JIT compilation)
-            warmup_payload = {
-                "model": args.model,
-                "messages": [{"role": "user", "content": "Count from 1 to 20."}],
-                "stream": True, "max_tokens": 64,
-            }
-            try:
-                async with client.stream(
-                    "POST", f"{base_url}/v1/chat/completions",
-                    json=warmup_payload,
-                    timeout=httpx.Timeout(300.0, connect=30.0),
-                ) as resp:
-                    async for line in resp.aiter_lines():
-                        if line and line.startswith("data: [DONE]"):
-                            break
-            except Exception:
-                pass
-
-            # Warmup 2: prefill with smallest test context (triggers prefill CUDA graphs)
             if prefill_contexts:
+                # Warmup: trigger CUDA graph compilation before measurements.
+                state.prefill_phase = True
+                state.current_context = 0
+                state.cell_running = True
+                state.cell_start = time.monotonic()
+                live.update(build_display(state))
+
+                # Warmup 1: short decode (triggers decode CUDA graphs / JIT compilation)
+                warmup_payload = {
+                    "model": args.model,
+                    "messages": [{"role": "user", "content": "Count from 1 to 20."}],
+                    "stream": True, "max_tokens": 64,
+                }
+                try:
+                    async with client.stream(
+                        "POST", f"{base_url}/v1/chat/completions",
+                        json=warmup_payload,
+                        timeout=httpx.Timeout(300.0, connect=30.0),
+                    ) as resp:
+                        async for line in resp.aiter_lines():
+                            if line and line.startswith("data: [DONE]"):
+                                break
+                except Exception:
+                    pass
+
+                # Warmup 2: prefill with smallest test context (triggers prefill CUDA graphs)
                 warmup_ctx = prefill_contexts[0]
                 warmup_prefix = f"[WARMUP_{run_id}] "
                 warmup_text = warmup_prefix + (context_cache.get(warmup_ctx, "") or generate_padding_text(warmup_ctx))
@@ -1119,67 +1120,62 @@ async def run_benchmark(args):
                 warmup_msgs = build_messages(warmup_ctx, warmup_text)
                 await measure_ttft(client, warmup_msgs)
 
-            # Measure baseline TTFT (ctx=0) to subtract overhead
-            baseline_msgs = [{"role": "user", "content": "Say OK."}]
-            baseline_samples = []
-            for _ in range(5):
-                t = await measure_ttft(client, baseline_msgs)
-                baseline_samples.append(t)
-            baseline_ttft = median(baseline_samples)
-            state.cell_running = False
-
-            # Now measure each prefill context
-            # Small contexts (<16k): repeat 3× and average for stability
-            # Large contexts: single measurement (long enough to be accurate)
-            REPEAT_THRESHOLD = 8192
-
-            for ctx in prefill_contexts:
-                state.current_concurrency = 1
-                state.current_context = ctx
-                state.cell_running = True
-                state.cell_start = time.monotonic()
-                state.cell_duration = 0
-                live.update(build_display(state))
-
-                repeats = 3 if ctx < REPEAT_THRESHOLD else 1
-                ttft_samples = []
-                for r in range(repeats):
-                    # Each repeat needs unique text to avoid cache
-                    if r == 0:
-                        msgs = build_messages(ctx, context_cache[ctx])
-                    else:
-                        # Generate variant with different prefix for repeat runs
-                        prefix = f"[BENCH_{run_id}_CTX_{ctx}_R{r}] "
-                        orig_prefix_len = len(f"[BENCH_{run_id}_CTX_{ctx}] ")
-                        variant_text = prefix + context_cache[ctx][orig_prefix_len:]
-                        msgs = build_messages(ctx, variant_text)
-                    t = await measure_ttft(client, msgs)
-                    ttft_samples.append(t)
-
-                raw_ttft = median(ttft_samples)
-                # Subtract baseline to get pure prefill time
-                prefill_time = max(raw_ttft - baseline_ttft, 0.001)
-                tok_per_sec = ctx / prefill_time
-
-                state.prefill_results[ctx] = {
-                    "ttft": raw_ttft,
-                    "prefill_time": prefill_time,
-                    "tok_per_sec": tok_per_sec,
-                    "baseline": baseline_ttft,
-                }
-
+                # Measure baseline TTFT (ctx=0) to subtract overhead
+                baseline_msgs = [{"role": "user", "content": "Say OK."}]
+                baseline_samples = []
+                for _ in range(5):
+                    t = await measure_ttft(client, baseline_msgs)
+                    baseline_samples.append(t)
+                baseline_ttft = median(baseline_samples)
                 state.cell_running = False
-                state.completed_tests += 1
-                cell_time = time.monotonic() - state.cell_start
-                state.cell_times.append(cell_time)
-                live.update(build_display(state))
-                await asyncio.sleep(1.0)
 
-            # Re-cache the primary text for decode phase (repeat runs used variants)
-            for ctx in prefill_contexts:
-                if ctx < REPEAT_THRESHOLD:
-                    msgs = build_messages(ctx, context_cache[ctx])
-                    await measure_ttft(client, msgs)
+                # Now measure each prefill context
+                REPEAT_THRESHOLD = 8192
+
+                for ctx in prefill_contexts:
+                    state.current_concurrency = 1
+                    state.current_context = ctx
+                    state.cell_running = True
+                    state.cell_start = time.monotonic()
+                    state.cell_duration = 0
+                    live.update(build_display(state))
+
+                    repeats = 3 if ctx < REPEAT_THRESHOLD else 1
+                    ttft_samples = []
+                    for r in range(repeats):
+                        if r == 0:
+                            msgs = build_messages(ctx, context_cache[ctx])
+                        else:
+                            prefix = f"[BENCH_{run_id}_CTX_{ctx}_R{r}] "
+                            orig_prefix_len = len(f"[BENCH_{run_id}_CTX_{ctx}] ")
+                            variant_text = prefix + context_cache[ctx][orig_prefix_len:]
+                            msgs = build_messages(ctx, variant_text)
+                        t = await measure_ttft(client, msgs)
+                        ttft_samples.append(t)
+
+                    raw_ttft = median(ttft_samples)
+                    prefill_time = max(raw_ttft - baseline_ttft, 0.001)
+                    tok_per_sec = ctx / prefill_time
+
+                    state.prefill_results[ctx] = {
+                        "ttft": raw_ttft,
+                        "prefill_time": prefill_time,
+                        "tok_per_sec": tok_per_sec,
+                        "baseline": baseline_ttft,
+                    }
+
+                    state.cell_running = False
+                    state.completed_tests += 1
+                    cell_time = time.monotonic() - state.cell_start
+                    state.cell_times.append(cell_time)
+                    live.update(build_display(state))
+                    await asyncio.sleep(1.0)
+
+                # Re-cache the primary text for decode phase (repeat runs used variants)
+                for ctx in prefill_contexts:
+                    if ctx < REPEAT_THRESHOLD:
+                        msgs = build_messages(ctx, context_cache[ctx])
+                        await measure_ttft(client, msgs)
 
             # Warm radix cache for decode contexts not already tested in prefill
             for ctx in context_lengths:
@@ -1440,6 +1436,10 @@ def parse_args():
         help="KV cache budget in tokens. Overrides auto-detection. "
              "Cells where concurrency × (context + max_tokens) > budget are skipped. "
              "Use this for vLLM where auto-detection is unreliable. (default: 0 = auto-detect)"
+    )
+    parser.add_argument(
+        "--skip-prefill", action="store_true",
+        help="Skip the prefill benchmark phase (Phase 1) and go straight to decode tests"
     )
     return parser.parse_args()
 
