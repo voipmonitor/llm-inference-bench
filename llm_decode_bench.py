@@ -409,6 +409,7 @@ async def run_one_cell(
     state: TUIState,
     live: Live,
     engine: str = ENGINE_SGLANG,
+    auth_headers: dict = None,
 ) -> CellResult:
     messages = build_messages(context_tokens, context_text)
     payload = {
@@ -429,7 +430,7 @@ async def run_one_cell(
         max_connections=concurrency + 10,
         max_keepalive_connections=concurrency + 5,
     )
-    cell_client = httpx.AsyncClient(limits=cell_limits)
+    cell_client = httpx.AsyncClient(limits=cell_limits, headers=auth_headers or {})
 
     # Update TUI state
     state.current_concurrency = concurrency
@@ -876,7 +877,19 @@ def build_display(state: TUIState) -> Layout:
 async def run_benchmark(args):
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
     context_lengths = [int(x) for x in args.contexts.split(",")]
-    base_url = f"http://{args.host}:{args.port}"
+    if args.host.startswith("http://") or args.host.startswith("https://"):
+        base_url = args.host.rstrip("/")
+        # Append --port if explicitly provided and URL doesn't already contain one
+        if args.port is not None:
+            from urllib.parse import urlparse
+            parsed = urlparse(base_url)
+            if parsed.port is None:
+                base_url = f"{parsed.scheme}://{parsed.hostname}:{args.port}{parsed.path}"
+    else:
+        port = args.port if args.port is not None else 5000
+        base_url = f"http://{args.host}:{port}"
+    server_label = base_url.replace("http://", "").replace("https://", "")
+    auth_headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
     console = Console()
 
     # --kv-budget overrides --max-total-tokens
@@ -888,7 +901,7 @@ async def run_benchmark(args):
     server_context_length = 0
     max_running = None
     engine = ENGINE_SGLANG
-    async with httpx.AsyncClient() as check_client:
+    async with httpx.AsyncClient(headers=auth_headers) as check_client:
         try:
             resp = await check_client.get(f"{base_url}/v1/models", timeout=10.0)
             models = resp.json()
@@ -1012,7 +1025,7 @@ async def run_benchmark(args):
     state = TUIState(
         engine=engine,
         model_name=args.model,
-        server_url=f"{args.host}:{args.port}",
+        server_url=server_label,
         total_tests=len(concurrency_levels) * len(context_lengths),
         concurrency_levels=concurrency_levels,
         context_lengths=context_lengths,
@@ -1082,7 +1095,7 @@ async def run_benchmark(args):
             pass
         return time.monotonic() - t0
 
-    async with httpx.AsyncClient(limits=limits) as client:
+    async with httpx.AsyncClient(limits=limits, headers=auth_headers) as client:
         with Live(build_display(state), refresh_per_second=2, console=console) as live:
 
             # === Phase 1: Prefill benchmark (C=1, max_tokens=1) ===
@@ -1225,6 +1238,7 @@ async def run_benchmark(args):
                             state=state,
                             live=live,
                             engine=engine,
+                            auth_headers=auth_headers,
                         )
                         all_results.append(result)
                         _partial_results = all_results
@@ -1375,7 +1389,7 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
         "metadata": {
             "engine": engine,
             "model": args.model,
-            "server": f"{args.host}:{args.port}",
+            "server": args.host if args.host.startswith("http") else f"{args.host}:{args.port or 5000}",
             "timestamp": datetime.now().isoformat(),
             "duration_per_test": args.duration,
             "max_tokens": args.max_tokens,
@@ -1400,8 +1414,16 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="LLM Inference Benchmark with Rich TUI Dashboard (SGLang + vLLM)"
     )
-    parser.add_argument("--host", default="localhost", help="Server host (default: localhost)")
-    parser.add_argument("--port", type=int, default=5000, help="Server port (default: 5000)")
+    parser.add_argument(
+        "--host", default="localhost",
+        help="Server host or full URL (default: localhost). "
+             "Accepts a full URL with scheme (e.g. https://ai.example.com) for HTTPS endpoints."
+    )
+    parser.add_argument("--port", type=int, default=None, help="Server port (default: 5000, or appended to URL when --host is a URL)")
+    parser.add_argument(
+        "--api-key", default="",
+        help="API key for authenticated endpoints (sent as Authorization: Bearer header)"
+    )
     parser.add_argument(
         "--concurrency", default="1,2,4,8,16,32,64,128",
         help="Comma-separated concurrency levels (default: 1,2,4,8,16,32,64,128)"
@@ -1459,7 +1481,7 @@ def main():
 
     console.print(Panel(
         f"[bold cyan]LLM Inference Benchmark[/bold cyan]\n"
-        f"Model: {args.model} @ {args.host}:{args.port}\n"
+        f"Model: {args.model} @ {args.host if args.host.startswith('http') else f'{args.host}:{args.port or 5000}'}\n"
         f"Decode concurrency: {concurrency_levels}\n"
         f"Decode contexts: {[format_context(c) for c in context_lengths]}\n"
         f"Duration: {args.duration}s per decode test | Max tokens: {args.max_tokens}\n"
