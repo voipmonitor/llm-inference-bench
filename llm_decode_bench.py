@@ -1190,25 +1190,8 @@ async def run_benchmark(args):
                         msgs = build_messages(ctx, context_cache[ctx])
                         await measure_ttft(client, msgs)
 
-            # Warm radix cache for decode contexts not already tested in prefill
-            for ctx in context_lengths:
-                if ctx > 0 and ctx not in prefill_contexts:
-                    warmup_msgs = build_messages(ctx, context_cache[ctx])
-                    warmup_payload = {
-                        "model": args.model, "messages": warmup_msgs,
-                        "stream": False, "max_tokens": 1,
-                    }
-                    try:
-                        await client.post(
-                            f"{base_url}/v1/chat/completions",
-                            json=warmup_payload,
-                            timeout=httpx.Timeout(600.0, connect=30.0),
-                        )
-                    except Exception:
-                        pass
-                    await asyncio.sleep(1.0)
-
             # === Phase 2: Decode benchmark (cached prefill, pure decode speed) ===
+            # Cache warming per context is handled by scout request in run_one_cell.
             state.prefill_phase = False
             for ctx in context_lengths:
                 for conc in concurrency_levels:
