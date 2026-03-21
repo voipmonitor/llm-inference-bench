@@ -1395,7 +1395,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
     if prefill_results:
         baseline = next(iter(prefill_results.values()), {}).get("baseline", 0)
         pt = Table(title=f"Prefill Speed (C=1, baseline TTFT={baseline:.3f}s subtracted)",
-                   border_style="magenta", caption=f"llm-decode-bench v{VERSION}")
+                   border_style="magenta")
         pt.add_column("Context", style="bold cyan")
         pt.add_column("Tokens", justify="right")
         pt.add_column("TTFT (s)", justify="right")
@@ -1417,8 +1417,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         console.print()
 
     # Aggregate throughput table
-    table = Table(title="Aggregate Throughput (tok/s)", border_style="green",
-                  caption=f"llm-decode-bench v{VERSION}")
+    table = Table(title="Aggregate Throughput (tok/s)", border_style="green")
     table.add_column("ctx \\ conc", style="bold cyan")
     for conc in concurrency_levels:
         table.add_column(str(conc), justify="right")
@@ -1448,8 +1447,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         console.print("[dim](X/Y) = avg running / requested concurrency — requests were queued[/dim]")
 
     # Per-request avg tok/s table
-    table2 = Table(title="Per-Request Avg Throughput (tok/s)", border_style="blue",
-                   caption=f"llm-decode-bench v{VERSION}")
+    table2 = Table(title="Per-Request Avg Throughput (tok/s)", border_style="blue")
     table2.add_column("ctx \\ conc", style="bold cyan")
     for conc in concurrency_levels:
         table2.add_column(str(conc), justify="right")
@@ -1472,8 +1470,8 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
     console.print(table2)
 
     # TTFT table
-    table3 = Table(title="Avg TTFT (seconds)", border_style="yellow",
-                   caption=f"llm-decode-bench v{VERSION}")
+    table3 = Table(title=f"Avg TTFT (seconds)  [dim]llm-decode-bench v{VERSION}[/dim]",
+                   border_style="yellow")
     table3.add_column("ctx \\ conc", style="bold cyan")
     for conc in concurrency_levels:
         table3.add_column(str(conc), justify="right")
@@ -1543,27 +1541,35 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
 
 # Global skip event — set by keyboard listener when 's' is pressed
 _skip_event = threading.Event()
+_original_term_settings = None
 
 
 def _keyboard_listener():
     """Background thread: listen for 's' key to skip current cell."""
+    global _original_term_settings
     try:
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        _original_term_settings = termios.tcgetattr(fd)
         tty.setcbreak(fd)
-        try:
-            while True:
-                if select.select([sys.stdin], [], [], 0.2)[0]:
-                    ch = sys.stdin.read(1)
-                    if ch.lower() == "s":
-                        _skip_event.set()
-                    elif ch.lower() == "q":
-                        # Allow 'q' to quit cleanly
-                        os._exit(0)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        while True:
+            if select.select([sys.stdin], [], [], 0.2)[0]:
+                ch = sys.stdin.read(1)
+                if ch.lower() == "s":
+                    _skip_event.set()
+                elif ch.lower() == "q":
+                    _restore_terminal()
+                    os._exit(0)
     except Exception:
         pass  # not a terminal (piped input, etc.)
+
+
+def _restore_terminal():
+    """Restore terminal to original settings (undo cbreak mode)."""
+    if _original_term_settings is not None:
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _original_term_settings)
+        except Exception:
+            pass
 
 
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/voipmonitor/llm-inference-bench/main/llm_decode_bench.py"
@@ -1736,4 +1742,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        _restore_terminal()
