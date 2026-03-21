@@ -10,6 +10,8 @@ Usage:
     python3 llm_decode_bench.py --port 5199 --concurrency 1,2,4 --contexts 0,16384
     python3 llm_decode_bench.py --port 5199 --kv-budget 692736
     python3 llm_decode_bench.py --port 5001 --max-tokens 4096
+    python3 llm_decode_bench.py --host https://openrouter.ai --api-key sk-or-... --model meta-llama/llama-3-70b
+    python3 llm_decode_bench.py --skip-prefill --concurrency 1,2,4 --contexts 0
 """
 
 import argparse
