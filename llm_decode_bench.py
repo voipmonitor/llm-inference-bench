@@ -1021,22 +1021,55 @@ async def run_benchmark(args):
         prefill_contexts = [max_prefill]
     console.print(f"[cyan]Prefill tests:[/cyan] {[format_context(c) for c in prefill_contexts]}")
 
-    # --- Step 3: Generate unique padding text per context length ---
-    # Each context gets a unique prefix so radix cache cannot match across lengths.
-    # Within same length, same text is reused → decode phase gets cache hit.
+    # --- Step 3: Generate padding text calibrated to actual token counts ---
+    # Send text to server to get exact prompt_tokens, then adjust length.
     all_ctx_sizes = sorted(set(prefill_contexts + [c for c in context_lengths if c > 0]))
     max_ctx = max(all_ctx_sizes) if all_ctx_sizes else 0
     context_cache = {}
     run_id = ''.join(random.choices(string.ascii_lowercase, k=12))
     if max_ctx > 0:
-        console.print(f"[bold]Generating padding texts (run={run_id}, up to {format_context(max_ctx)})...[/bold]")
-        base_text = generate_padding_text(max_ctx)
-        for ctx in all_ctx_sizes:
-            # Unique prefix per run + context length → no cross-run or cross-length cache hits
+        console.print(f"[bold]Generating and calibrating padding texts (run={run_id}, up to {format_context(max_ctx)})...[/bold]")
+        # Generate large base text (oversize to allow trimming)
+        base_text = generate_padding_text(int(max_ctx * 1.5))
+
+        async def calibrate_text(client, ctx, base, run_id):
+            """Adjust text length so server tokenizes it to ~ctx tokens."""
             prefix = f"[BENCH_{run_id}_CTX_{ctx}] "
-            target_chars = ctx * CHARS_PER_TOKEN
-            text = prefix + base_text
-            context_cache[ctx] = text[:target_chars]
+            # Start with estimated char count, then refine
+            chars_per_tok = CHARS_PER_TOKEN
+            for attempt in range(3):
+                target_chars = int(ctx * chars_per_tok)
+                text = (prefix + base)[:target_chars]
+                msgs = build_messages(ctx, text)
+                payload = {
+                    "model": args.model, "messages": msgs,
+                    "stream": False, "max_tokens": 1,
+                    "stream_options": {"include_usage": True},
+                }
+                try:
+                    resp = await client.post(
+                        f"{base_url}/v1/chat/completions",
+                        json=payload,
+                        timeout=httpx.Timeout(600.0, connect=30.0),
+                    )
+                    data = resp.json()
+                    actual = data.get("usage", {}).get("prompt_tokens", 0)
+                    if actual > 0:
+                        # Adjust chars_per_tok ratio based on actual tokenization
+                        chars_per_tok = len(text) / actual
+                        if abs(actual - ctx) / max(ctx, 1) < 0.05:
+                            # Within 5% — good enough
+                            return text, actual
+                except Exception:
+                    break
+            return text, actual if actual > 0 else ctx
+
+        async with httpx.AsyncClient(headers=auth_headers) as cal_client:
+            for ctx in all_ctx_sizes:
+                text, actual_tokens = await calibrate_text(cal_client, ctx, base_text, run_id)
+                context_cache[ctx] = text
+                label = f"{actual_tokens:,}" if abs(actual_tokens - ctx) > ctx * 0.02 else f"{ctx:,}"
+                console.print(f"  {format_context(ctx)}: {len(text):,} chars → {actual_tokens:,} tokens")
     context_cache[0] = ""
     console.print("[green]Done.[/green]\n")
 
@@ -1223,6 +1256,35 @@ async def run_benchmark(args):
                     state.cell_times.append(cell_time)
                     live.update(build_display(state))
                     await asyncio.sleep(1.0)
+
+            # === Warmup probe: ensure CUDA graphs / JIT compiled before decode ===
+            # This runs even with --skip-prefill. Sends a short request to trigger
+            # kernel compilation so the first decode cell isn't contaminated.
+            if not prefill_contexts:
+                state.prefill_phase = True
+                state.current_context = 0
+                state.cell_running = True
+                state.cell_start = time.monotonic()
+                live.update(build_display(state))
+
+                warmup_payload = {
+                    "model": args.model,
+                    "messages": [{"role": "user", "content": "Count from 1 to 20."}],
+                    "stream": True, "max_tokens": 64,
+                }
+                try:
+                    async with client.stream(
+                        "POST", f"{base_url}/v1/chat/completions",
+                        json=warmup_payload,
+                        timeout=httpx.Timeout(300.0, connect=30.0),
+                    ) as resp:
+                        async for line in resp.aiter_lines():
+                            if line and line.startswith("data: [DONE]"):
+                                break
+                except Exception:
+                    pass
+                state.cell_running = False
+                live.update(build_display(state))
 
             # === Phase 2: Decode benchmark (cached prefill, pure decode speed) ===
             # Cache warming per context is handled by scout request in run_one_cell.
