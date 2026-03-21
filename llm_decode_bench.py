@@ -844,31 +844,29 @@ def build_display(state: TUIState) -> Layout:
 
     # Prefill table (shown alongside decode results)
     if state.prefill_contexts:
-        prefill_table = Table(title="Prefill Speed (C=1)", border_style="magenta", expand=True)
-        prefill_table.add_column("Context", style="bold cyan", min_width=6)
-        prefill_table.add_column("Tokens", justify="right", min_width=6)
-        prefill_table.add_column("TTFT", justify="right", min_width=6)
-        prefill_table.add_column("Prefill", justify="right", min_width=6)
-        prefill_table.add_column("tok/s", justify="right", min_width=8)
-        prefill_table.add_column("N", justify="right", min_width=3)
+        prefill_table = Table(title="Prefill (C=1)", border_style="magenta", expand=True)
+        prefill_table.add_column("ctx", style="bold cyan")
+        prefill_table.add_column("TTFT", justify="right")
+        prefill_table.add_column("tok/s", justify="right")
+        prefill_table.add_column("N", justify="right")
         for ctx in state.prefill_contexts:
             if ctx in state.prefill_results:
                 pr = state.prefill_results[ctx]
-                pt = pr.get('prompt_tokens', ctx)
-                prefill_table.add_row(
-                    format_context(ctx),
-                    f"{pt:,}" if pt != ctx else f"~{ctx:,}",
-                    f"{pr['ttft']:.2f}s",
-                    f"{pr.get('prefill_time', pr['ttft']):.2f}s",
-                    f"[bold green]{pr['tok_per_sec']:,.0f}[/bold green]",
-                    str(pr.get('samples', '?')),
-                )
+                if pr.get("skipped"):
+                    prefill_table.add_row(format_context(ctx), "[yellow]skip[/yellow]", "", "")
+                else:
+                    prefill_table.add_row(
+                        format_context(ctx),
+                        f"{pr['ttft']:.2f}s",
+                        f"[bold green]{pr['tok_per_sec']:,.0f}[/bold green]",
+                        str(pr.get('samples', '')),
+                    )
             else:
-                prefill_table.add_row(format_context(ctx), "[dim]...[/dim]", "[dim]...[/dim]", "[dim]...[/dim]", "")
+                prefill_table.add_row(format_context(ctx), "[dim]...[/dim]", "[dim]...[/dim]", "")
 
         results_layout = Layout()
         results_layout.split_row(
-            Layout(Panel(prefill_table), size=55),
+            Layout(Panel(prefill_table), size=38),
             Layout(Panel(results_table)),
         )
         layout["results"].update(results_layout)
