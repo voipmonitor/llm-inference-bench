@@ -170,6 +170,14 @@ class TUIState:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def parse_token_value(s: str) -> int:
+    """Parse token value with optional k/K suffix: '16384', '16k', '128K' → int."""
+    s = s.strip()
+    if s.lower().endswith("k"):
+        return int(float(s[:-1]) * 1024)
+    return int(s)
+
+
 def generate_padding_text(target_tokens: int) -> str:
     target_chars = target_tokens * CHARS_PER_TOKEN
     lines = []
@@ -887,7 +895,7 @@ def build_display(state: TUIState) -> Layout:
 
 async def run_benchmark(args):
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
-    context_lengths = [int(x) for x in args.contexts.split(",")]
+    context_lengths = [parse_token_value(x) for x in args.contexts.split(",")]
     if args.host.startswith("http://") or args.host.startswith("https://"):
         base_url = args.host.rstrip("/")
         # Append --port if explicitly provided and URL doesn't already contain one
@@ -1382,7 +1390,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
 
 def save_results(results: list, args, filepath: str, prefill_results: dict = None, engine: str = ""):
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
-    context_lengths = [int(x) for x in args.contexts.split(",")]
+    context_lengths = [parse_token_value(x) for x in args.contexts.split(",")]
 
     # Build summary table (exclude skipped)
     summary = {}
@@ -1514,8 +1522,8 @@ def parse_args():
         help="Comma-separated concurrency levels (default: 1,2,4,8,16,32,64,128)"
     )
     parser.add_argument(
-        "--contexts", default="0,16384,32768,65536,131072",
-        help="Comma-separated context lengths in tokens (default: 0,16384,32768,65536,131072)"
+        "--contexts", default="0,16k,32k,64k,128k",
+        help="Comma-separated context lengths in tokens, supports k suffix (default: 0,16k,32k,64k,128k)"
     )
     parser.add_argument(
         "--duration", type=float, default=30.0,
@@ -1562,7 +1570,7 @@ def main():
     args = parse_args()
 
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
-    context_lengths = [int(x) for x in args.contexts.split(",")]
+    context_lengths = [parse_token_value(x) for x in args.contexts.split(",")]
     decode_count = len(concurrency_levels) * len(context_lengths)
 
     console.print(Panel(
