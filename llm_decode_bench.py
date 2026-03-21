@@ -1460,15 +1460,21 @@ def check_for_update(console: Console) -> bool:
             git_dir = os.path.join(script_dir, ".git")
             if os.path.isdir(git_dir):
                 console.print("[cyan]Upgrading via git pull...[/cyan]")
-                result = subprocess.run(
-                    ["git", "pull", "origin", "main"],
+                script_name = os.path.basename(__file__)
+                r1 = subprocess.run(
+                    ["git", "fetch", "origin", "main"],
                     cwd=script_dir, capture_output=True, text=True,
                 )
-                if result.returncode == 0:
+                r2 = subprocess.run(
+                    ["git", "checkout", "origin/main", "--", script_name],
+                    cwd=script_dir, capture_output=True, text=True,
+                )
+                if r1.returncode == 0 and r2.returncode == 0:
                     console.print(f"[green]Updated to v{remote_version}. Restarting...[/green]\n")
                     os.execv(sys.executable, [sys.executable] + sys.argv)
                 else:
-                    console.print(f"[red]git pull failed: {result.stderr.strip()}[/red]")
+                    err = r1.stderr.strip() or r2.stderr.strip()
+                    console.print(f"[red]git update failed: {err}[/red]")
                     return False
             else:
                 # Fallback: download file directly
