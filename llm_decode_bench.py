@@ -15,9 +15,11 @@ Usage:
 import argparse
 import asyncio
 import json
+import os
 import random
 import re
 import string
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field, asdict
@@ -37,6 +39,8 @@ from rich.text import Text
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+VERSION = "0.2.0"
 
 CHARS_PER_TOKEN = 4
 
@@ -819,25 +823,30 @@ def build_display(state: TUIState) -> Layout:
     if state.prefill_contexts:
         prefill_table = Table(title="Prefill Speed (C=1)", border_style="magenta", expand=True)
         prefill_table.add_column("Context", style="bold cyan", min_width=6)
+        prefill_table.add_column("Tokens", justify="right", min_width=6)
         prefill_table.add_column("TTFT", justify="right", min_width=6)
         prefill_table.add_column("Prefill", justify="right", min_width=6)
         prefill_table.add_column("tok/s", justify="right", min_width=8)
+        prefill_table.add_column("N", justify="right", min_width=3)
         for ctx in state.prefill_contexts:
             if ctx in state.prefill_results:
                 pr = state.prefill_results[ctx]
+                pt = pr.get('prompt_tokens', ctx)
                 prefill_table.add_row(
                     format_context(ctx),
+                    f"{pt:,}" if pt != ctx else f"~{ctx:,}",
                     f"{pr['ttft']:.2f}s",
                     f"{pr.get('prefill_time', pr['ttft']):.2f}s",
                     f"[bold green]{pr['tok_per_sec']:,.0f}[/bold green]",
+                    str(pr.get('samples', '?')),
                 )
             else:
-                prefill_table.add_row(format_context(ctx), "[dim]...[/dim]", "[dim]...[/dim]", "[dim]...[/dim]")
+                prefill_table.add_row(format_context(ctx), "[dim]...[/dim]", "[dim]...[/dim]", "[dim]...[/dim]", "")
 
         results_layout = Layout()
         results_layout.split_row(
-            Layout(Panel(prefill_table), ratio=1),
-            Layout(Panel(results_table), ratio=3),
+            Layout(Panel(prefill_table), size=55),
+            Layout(Panel(results_table)),
         )
         layout["results"].update(results_layout)
     else:
@@ -1063,14 +1072,18 @@ async def run_benchmark(args):
     limits = httpx.Limits(max_connections=max_conc + 20, max_keepalive_connections=max_conc + 10)
 
     async def measure_ttft(client, messages):
-        """Send one streaming request with max_tokens=1, return TTFT in seconds."""
+        """Send one streaming request with max_tokens=1, return (TTFT, prompt_tokens).
+        prompt_tokens is None if not available from server."""
         payload = {
             "model": args.model,
             "messages": messages,
             "stream": True,
             "max_tokens": 1,
+            "stream_options": {"include_usage": True},
         }
         t0 = time.monotonic()
+        ttft = None
+        prompt_tokens = None
         try:
             async with client.stream(
                 "POST", f"{base_url}/v1/chat/completions",
@@ -1087,13 +1100,19 @@ async def run_benchmark(args):
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
-                    if "choices" in data and len(data["choices"]) > 0:
+                    # Capture usage (comes in final chunk)
+                    usage = data.get("usage")
+                    if usage and "prompt_tokens" in usage:
+                        prompt_tokens = usage["prompt_tokens"]
+                    if ttft is None and "choices" in data and len(data["choices"]) > 0:
                         delta = data["choices"][0].get("delta", {})
                         if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content"):
-                            return time.monotonic() - t0
+                            ttft = time.monotonic() - t0
         except Exception:
             pass
-        return time.monotonic() - t0
+        if ttft is None:
+            ttft = time.monotonic() - t0
+        return ttft, prompt_tokens
 
     async with httpx.AsyncClient(limits=limits, headers=auth_headers) as client:
         with Live(build_display(state), refresh_per_second=2, console=console) as live:
@@ -1137,44 +1156,55 @@ async def run_benchmark(args):
                 baseline_msgs = [{"role": "user", "content": "Say OK."}]
                 baseline_samples = []
                 for _ in range(5):
-                    t = await measure_ttft(client, baseline_msgs)
+                    t, _ = await measure_ttft(client, baseline_msgs)
                     baseline_samples.append(t)
                 baseline_ttft = median(baseline_samples)
                 state.cell_running = False
 
-                # Now measure each prefill context
-                REPEAT_THRESHOLD = 8192
+                # Measure each prefill context: repeat for a fixed duration to collect
+                # many samples. Each request uses a unique prefix to avoid cache hits.
+                PREFILL_DURATION = 10.0  # seconds per context size
 
                 for ctx in prefill_contexts:
                     state.current_concurrency = 1
                     state.current_context = ctx
                     state.cell_running = True
                     state.cell_start = time.monotonic()
-                    state.cell_duration = 0
+                    state.cell_duration = PREFILL_DURATION
                     live.update(build_display(state))
 
-                    repeats = 3 if ctx < REPEAT_THRESHOLD else 1
                     ttft_samples = []
-                    for r in range(repeats):
-                        if r == 0:
-                            msgs = build_messages(ctx, context_cache[ctx])
-                        else:
-                            prefix = f"[BENCH_{run_id}_CTX_{ctx}_R{r}] "
-                            orig_prefix_len = len(f"[BENCH_{run_id}_CTX_{ctx}] ")
-                            variant_text = prefix + context_cache[ctx][orig_prefix_len:]
-                            msgs = build_messages(ctx, variant_text)
-                        t = await measure_ttft(client, msgs)
+                    actual_prompt_tokens = None
+                    orig_prefix_len = len(f"[BENCH_{run_id}_CTX_{ctx}] ")
+                    r = 0
+                    while True:
+                        elapsed = time.monotonic() - state.cell_start
+                        if elapsed >= PREFILL_DURATION and len(ttft_samples) >= 2:
+                            break
+                        # Unique prefix per iteration → no prefix cache hit
+                        prefix = f"[BENCH_{run_id}_CTX_{ctx}_R{r}] "
+                        variant_text = prefix + context_cache[ctx][orig_prefix_len:]
+                        msgs = build_messages(ctx, variant_text)
+                        t, pt = await measure_ttft(client, msgs)
                         ttft_samples.append(t)
+                        if pt is not None and actual_prompt_tokens is None:
+                            actual_prompt_tokens = pt
+                        r += 1
+                        live.update(build_display(state))
 
                     raw_ttft = median(ttft_samples)
                     prefill_time = max(raw_ttft - baseline_ttft, 0.001)
-                    tok_per_sec = ctx / prefill_time
+                    # Use actual prompt tokens from server if available
+                    token_count = actual_prompt_tokens if actual_prompt_tokens else ctx
+                    tok_per_sec = token_count / prefill_time
 
                     state.prefill_results[ctx] = {
                         "ttft": raw_ttft,
                         "prefill_time": prefill_time,
                         "tok_per_sec": tok_per_sec,
                         "baseline": baseline_ttft,
+                        "samples": len(ttft_samples),
+                        "prompt_tokens": token_count,
                     }
 
                     state.cell_running = False
@@ -1183,12 +1213,6 @@ async def run_benchmark(args):
                     state.cell_times.append(cell_time)
                     live.update(build_display(state))
                     await asyncio.sleep(1.0)
-
-                # Re-cache the primary text for decode phase (repeat runs used variants)
-                for ctx in prefill_contexts:
-                    if ctx < REPEAT_THRESHOLD:
-                        msgs = build_messages(ctx, context_cache[ctx])
-                        await measure_ttft(client, msgs)
 
             # === Phase 2: Decode benchmark (cached prefill, pure decode speed) ===
             # Cache warming per context is handled by scout request in run_one_cell.
@@ -1256,24 +1280,30 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
     if prefill_results:
         baseline = next(iter(prefill_results.values()), {}).get("baseline", 0)
         pt = Table(title=f"Prefill Speed (C=1, baseline TTFT={baseline:.3f}s subtracted)",
-                   border_style="magenta")
+                   border_style="magenta", caption=f"llm-decode-bench v{VERSION}")
         pt.add_column("Context", style="bold cyan")
+        pt.add_column("Tokens", justify="right")
         pt.add_column("TTFT (s)", justify="right")
         pt.add_column("Prefill (s)", justify="right")
         pt.add_column("Prefill tok/s", justify="right")
+        pt.add_column("N", justify="right")
         for ctx in sorted(prefill_results.keys()):
             pr = prefill_results[ctx]
+            ptok = pr.get('prompt_tokens', ctx)
             pt.add_row(
                 format_context(ctx),
+                f"{ptok:,}" if ptok != ctx else f"~{ctx:,}",
                 f"{pr['ttft']:.2f}",
                 f"{pr.get('prefill_time', pr['ttft']):.2f}",
                 f"{pr['tok_per_sec']:,.0f}",
+                str(pr.get('samples', '?')),
             )
         console.print(pt)
         console.print()
 
     # Aggregate throughput table
-    table = Table(title="Aggregate Throughput (tok/s)", border_style="green")
+    table = Table(title="Aggregate Throughput (tok/s)", border_style="green",
+                  caption=f"llm-decode-bench v{VERSION}")
     table.add_column("ctx \\ conc", style="bold cyan")
     for conc in concurrency_levels:
         table.add_column(str(conc), justify="right")
@@ -1303,7 +1333,8 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         console.print("[dim](X/Y) = avg running / requested concurrency — requests were queued[/dim]")
 
     # Per-request avg tok/s table
-    table2 = Table(title="Per-Request Avg Throughput (tok/s)", border_style="blue")
+    table2 = Table(title="Per-Request Avg Throughput (tok/s)", border_style="blue",
+                   caption=f"llm-decode-bench v{VERSION}")
     table2.add_column("ctx \\ conc", style="bold cyan")
     for conc in concurrency_levels:
         table2.add_column(str(conc), justify="right")
@@ -1326,7 +1357,8 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
     console.print(table2)
 
     # TTFT table
-    table3 = Table(title="Avg TTFT (seconds)", border_style="yellow")
+    table3 = Table(title="Avg TTFT (seconds)", border_style="yellow",
+                   caption=f"llm-decode-bench v{VERSION}")
     table3.add_column("ctx \\ conc", style="bold cyan")
     for conc in concurrency_levels:
         table3.add_column(str(conc), justify="right")
@@ -1370,6 +1402,7 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
 
     output = {
         "metadata": {
+            "version": VERSION,
             "engine": engine,
             "model": args.model,
             "server": args.host if args.host.startswith("http") else f"{args.host}:{args.port or 5000}",
@@ -1392,6 +1425,67 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/voipmonitor/llm-inference-bench/main/llm_decode_bench.py"
+
+
+def parse_version(v: str) -> tuple:
+    """Parse version string like '0.2.0' into tuple (0, 2, 0) for comparison."""
+    return tuple(int(x) for x in v.strip().split("."))
+
+
+def check_for_update(console: Console) -> bool:
+    """Check GitHub for newer version. Returns True if user chose to upgrade and re-exec."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(GITHUB_RAW_URL, method="GET")
+        req.add_header("User-Agent", f"llm-decode-bench/{VERSION}")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            # Read only first 2KB to find VERSION line
+            head = resp.read(2048).decode("utf-8", errors="ignore")
+        m = re.search(r'^VERSION\s*=\s*"([^"]+)"', head, re.MULTILINE)
+        if not m:
+            return False
+        remote_version = m.group(1)
+        if parse_version(remote_version) <= parse_version(VERSION):
+            return False
+
+        console.print(
+            f"\n[bold yellow]New version available: v{remote_version} (current: v{VERSION})[/bold yellow]"
+        )
+        answer = console.input("[bold]Upgrade and restart? [Y/n]: [/bold]").strip().lower()
+        if answer in ("", "y", "yes"):
+            # Try git pull first (cleanest)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            git_dir = os.path.join(script_dir, ".git")
+            if os.path.isdir(git_dir):
+                console.print("[cyan]Upgrading via git pull...[/cyan]")
+                result = subprocess.run(
+                    ["git", "pull", "origin", "main"],
+                    cwd=script_dir, capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    console.print(f"[green]Updated to v{remote_version}. Restarting...[/green]\n")
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                else:
+                    console.print(f"[red]git pull failed: {result.stderr.strip()}[/red]")
+                    return False
+            else:
+                # Fallback: download file directly
+                console.print("[cyan]Downloading update...[/cyan]")
+                script_path = os.path.abspath(__file__)
+                with urllib.request.urlopen(GITHUB_RAW_URL, timeout=30) as resp:
+                    new_content = resp.read()
+                with open(script_path, "wb") as f:
+                    f.write(new_content)
+                console.print(f"[green]Updated to v{remote_version}. Restarting...[/green]\n")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+        else:
+            console.print("[dim]Skipping update.[/dim]\n")
+    except Exception:
+        pass  # Network error, no git, etc. — silently continue
+    return False
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -1455,8 +1549,9 @@ _prefill_results: dict = {}
 
 def main():
     global _partial_results, _prefill_results
-    args = parse_args()
     console = Console()
+    check_for_update(console)
+    args = parse_args()
 
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
     context_lengths = [int(x) for x in args.contexts.split(",")]
