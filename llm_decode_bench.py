@@ -20,10 +20,14 @@ import json
 import os
 import random
 import re
+import select
 import string
 import subprocess
 import sys
+import termios
+import threading
 import time
+import tty
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from statistics import mean, median
@@ -598,6 +602,12 @@ async def run_one_cell(
             cancel_event.set()
             break
 
+        # Check skip key
+        if _skip_event.is_set():
+            _skip_event.clear()
+            cancel_event.set()
+            return CellResult(concurrency=concurrency, context_tokens=context_tokens, aggregate_tps=-2)
+
         # Check if all tasks already done
         if all(t.done() for t in tasks):
             break
@@ -805,6 +815,9 @@ def build_display(state: TUIState) -> Layout:
             key = (ctx, conc)
             if key in state.results:
                 val = state.results[key]
+                if val == -2:
+                    row.append("[yellow]skipped[/yellow]")
+                    continue
                 if val < 0:
                     needed = conc * (ctx + state.max_tokens)
                     row.append(f"[dim]N/A ({needed // 1024}k)[/dim]")
@@ -880,7 +893,8 @@ def build_display(state: TUIState) -> Layout:
             f"  [{bar}]  "
             f"{state.completed_tests}/{state.total_tests}  "
             f"Elapsed: {format_time(elapsed_total)}  "
-            f"ETA: {eta_str}"
+            f"ETA: {eta_str}  "
+            f"[dim]s=skip  q=quit[/dim]"
         )
     else:
         footer_text = "Initializing..."
@@ -1220,9 +1234,14 @@ async def run_benchmark(args):
                     actual_prompt_tokens = None
                     orig_prefix_len = len(f"[BENCH_{run_id}_CTX_{ctx}] ")
                     r = 0
+                    skipped = False
                     while True:
                         elapsed = time.monotonic() - state.cell_start
                         if elapsed >= PREFILL_DURATION and len(ttft_samples) >= 2:
+                            break
+                        if _skip_event.is_set():
+                            _skip_event.clear()
+                            skipped = True
                             break
                         # Unique prefix per iteration → no prefix cache hit
                         prefix = f"[BENCH_{run_id}_CTX_{ctx}_R{r}] "
@@ -1235,20 +1254,26 @@ async def run_benchmark(args):
                         r += 1
                         live.update(build_display(state))
 
-                    raw_ttft = median(ttft_samples)
-                    prefill_time = max(raw_ttft - baseline_ttft, 0.001)
-                    # Use actual prompt tokens from server if available
-                    token_count = actual_prompt_tokens if actual_prompt_tokens else ctx
-                    tok_per_sec = token_count / prefill_time
+                    if skipped or not ttft_samples:
+                        state.prefill_results[ctx] = {
+                            "ttft": 0, "prefill_time": 0, "tok_per_sec": 0,
+                            "baseline": baseline_ttft, "samples": 0,
+                            "prompt_tokens": 0, "skipped": True,
+                        }
+                    else:
+                        raw_ttft = median(ttft_samples)
+                        prefill_time = max(raw_ttft - baseline_ttft, 0.001)
+                        token_count = actual_prompt_tokens if actual_prompt_tokens else ctx
+                        tok_per_sec = token_count / prefill_time
 
-                    state.prefill_results[ctx] = {
-                        "ttft": raw_ttft,
-                        "prefill_time": prefill_time,
-                        "tok_per_sec": tok_per_sec,
-                        "baseline": baseline_ttft,
-                        "samples": len(ttft_samples),
-                        "prompt_tokens": token_count,
-                    }
+                        state.prefill_results[ctx] = {
+                            "ttft": raw_ttft,
+                            "prefill_time": prefill_time,
+                            "tok_per_sec": tok_per_sec,
+                            "baseline": baseline_ttft,
+                            "samples": len(ttft_samples),
+                            "prompt_tokens": token_count,
+                        }
 
                     state.cell_running = False
                     state.completed_tests += 1
@@ -1288,9 +1313,27 @@ async def run_benchmark(args):
 
             # === Phase 2: Decode benchmark (cached prefill, pure decode speed) ===
             # Cache warming per context is handled by scout request in run_one_cell.
+            # Order: 1) first column (C=first, all ctx) — baseline
+            #        2) first row (ctx=first, all C) — concurrency scaling
+            #        3) rest row by row
             state.prefill_phase = False
+            first_conc = concurrency_levels[0]
+            first_ctx = context_lengths[0]
+            test_order = []
+            # 1) First column: C=first, all contexts
             for ctx in context_lengths:
-                for conc in concurrency_levels:
+                test_order.append((ctx, first_conc))
+            # 2) First row: ctx=first, remaining C
+            for conc in concurrency_levels[1:]:
+                test_order.append((first_ctx, conc))
+            # 3) Rest: row by row, skip already added
+            done_set = set(test_order)
+            for ctx in context_lengths[1:]:
+                for conc in concurrency_levels[1:]:
+                    if (ctx, conc) not in done_set:
+                        test_order.append((ctx, conc))
+
+            for ctx, conc in test_order:
                     # Skip cells that exceed token budget
                     cell_total = conc * (ctx + args.max_tokens)
                     if args.max_total_tokens > 0 and cell_total > args.max_total_tokens:
@@ -1319,6 +1362,8 @@ async def run_benchmark(args):
                             engine=engine,
                             auth_headers=auth_headers,
                         )
+                        if result.aggregate_tps == -2:
+                            state.results[(ctx, conc)] = -2
                         all_results.append(result)
                         _partial_results = all_results
                     except Exception as e:
@@ -1498,6 +1543,31 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
 # CLI
 # ---------------------------------------------------------------------------
 
+# Global skip event — set by keyboard listener when 's' is pressed
+_skip_event = threading.Event()
+
+
+def _keyboard_listener():
+    """Background thread: listen for 's' key to skip current cell."""
+    try:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        try:
+            while True:
+                if select.select([sys.stdin], [], [], 0.2)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch.lower() == "s":
+                        _skip_event.set()
+                    elif ch.lower() == "q":
+                        # Allow 'q' to quit cleanly
+                        os._exit(0)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    except Exception:
+        pass  # not a terminal (piped input, etc.)
+
+
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/voipmonitor/llm-inference-bench/main/llm_decode_bench.py"
 
 
@@ -1630,6 +1700,10 @@ def main():
     console = Console()
     check_for_update(console)
     args = parse_args()
+
+    # Start keyboard listener (background daemon thread)
+    kb_thread = threading.Thread(target=_keyboard_listener, daemon=True)
+    kb_thread.start()
 
     concurrency_levels = [int(x) for x in args.concurrency.split(",")]
     context_lengths = [parse_token_value(x) for x in args.contexts.split(",")]
