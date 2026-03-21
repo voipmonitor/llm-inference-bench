@@ -1036,54 +1036,54 @@ async def run_benchmark(args):
     console.print(f"[cyan]Prefill tests:[/cyan] {[format_context(c) for c in prefill_contexts]}")
 
     # --- Step 3: Generate padding text calibrated to actual token counts ---
-    # Send text to server to get exact prompt_tokens, then adjust length.
+    # Calibrate chars_per_token ratio once on a small context (~8k), then extrapolate.
+    # This avoids sending huge requests (128k+) just for calibration.
     all_ctx_sizes = sorted(set(prefill_contexts + [c for c in context_lengths if c > 0]))
     max_ctx = max(all_ctx_sizes) if all_ctx_sizes else 0
     context_cache = {}
     run_id = ''.join(random.choices(string.ascii_lowercase, k=12))
     if max_ctx > 0:
-        console.print(f"[bold]Generating and calibrating padding texts (run={run_id}, up to {format_context(max_ctx)})...[/bold]")
-        # Generate large base text (oversize to allow trimming)
+        console.print(f"[bold]Calibrating padding text (run={run_id}, up to {format_context(max_ctx)})...[/bold]")
         base_text = generate_padding_text(int(max_ctx * 1.5))
 
-        async def calibrate_text(client, ctx, base, run_id):
-            """Adjust text length so server tokenizes it to ~ctx tokens."""
-            prefix = f"[BENCH_{run_id}_CTX_{ctx}] "
-            # Start with estimated char count, then refine
-            chars_per_tok = CHARS_PER_TOKEN
+        # Calibrate on small context: send ~8k tokens, measure actual, derive ratio
+        calibrated_cpt = CHARS_PER_TOKEN
+        cal_ctx = min(8192, max_ctx)
+        async with httpx.AsyncClient(headers=auth_headers) as cal_client:
+            prefix = f"[BENCH_{run_id}_CAL] "
             for attempt in range(3):
-                target_chars = int(ctx * chars_per_tok)
-                text = (prefix + base)[:target_chars]
-                msgs = build_messages(ctx, text)
+                target_chars = int(cal_ctx * calibrated_cpt)
+                cal_text = (prefix + base_text)[:target_chars]
+                msgs = build_messages(cal_ctx, cal_text)
                 payload = {
                     "model": args.model, "messages": msgs,
                     "stream": False, "max_tokens": 1,
                     "stream_options": {"include_usage": True},
                 }
                 try:
-                    resp = await client.post(
+                    resp = await cal_client.post(
                         f"{base_url}/v1/chat/completions",
                         json=payload,
-                        timeout=httpx.Timeout(600.0, connect=30.0),
+                        timeout=httpx.Timeout(120.0, connect=30.0),
                     )
                     data = resp.json()
                     actual = data.get("usage", {}).get("prompt_tokens", 0)
                     if actual > 0:
-                        # Adjust chars_per_tok ratio based on actual tokenization
-                        chars_per_tok = len(text) / actual
-                        if abs(actual - ctx) / max(ctx, 1) < 0.05:
-                            # Within 5% — good enough
-                            return text, actual
+                        calibrated_cpt = len(cal_text) / actual
+                        if abs(actual - cal_ctx) / cal_ctx < 0.05:
+                            break
                 except Exception:
                     break
-            return text, actual if actual > 0 else ctx
+        console.print(f"  Calibrated: {calibrated_cpt:.2f} chars/token (from {format_context(cal_ctx)} probe)")
 
-        async with httpx.AsyncClient(headers=auth_headers) as cal_client:
-            for ctx in all_ctx_sizes:
-                text, actual_tokens = await calibrate_text(cal_client, ctx, base_text, run_id)
-                context_cache[ctx] = text
-                label = f"{actual_tokens:,}" if abs(actual_tokens - ctx) > ctx * 0.02 else f"{ctx:,}"
-                console.print(f"  {format_context(ctx)}: {len(text):,} chars → {actual_tokens:,} tokens")
+        # Generate text for each context size using calibrated ratio
+        for ctx in all_ctx_sizes:
+            prefix = f"[BENCH_{run_id}_CTX_{ctx}] "
+            target_chars = int(ctx * calibrated_cpt)
+            text = (prefix + base_text)[:target_chars]
+            context_cache[ctx] = text
+            est_tokens = int(len(text) / calibrated_cpt)
+            console.print(f"  {format_context(ctx)}: {len(text):,} chars (~{est_tokens:,} tokens)")
     context_cache[0] = ""
     console.print("[green]Done.[/green]\n")
 
