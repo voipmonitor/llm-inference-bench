@@ -1101,17 +1101,29 @@ async def run_benchmark(args):
     state.prefill_contexts = prefill_contexts
 
     # Mark skipped decode cells
+    max_run = state.max_running_requests or 0
+
+    def _should_skip(ctx, conc):
+        if args.max_total_tokens <= 0:
+            return False
+        # Never skip if concurrency is within server's max_running_requests
+        # and context is 0 (server manages KV allocation dynamically)
+        if ctx == 0 and max_run > 0 and conc <= max_run:
+            return False
+        return conc * (ctx + args.max_tokens) > args.max_total_tokens
+
     if args.max_total_tokens > 0:
         state.kv_cache_budget = args.max_total_tokens
+
         runnable = sum(
             1 for ctx in context_lengths for conc in concurrency_levels
-            if conc * (ctx + args.max_tokens) <= args.max_total_tokens
+            if not _should_skip(ctx, conc)
         )
         skipped = state.total_tests - runnable
         state.skipped_cells = skipped
         for ctx in context_lengths:
             for conc in concurrency_levels:
-                if conc * (ctx + args.max_tokens) > args.max_total_tokens:
+                if _should_skip(ctx, conc):
                     state.results[(ctx, conc)] = -1
 
     # Add prefill tests to total count (unless skipped)
@@ -1333,8 +1345,7 @@ async def run_benchmark(args):
 
             for ctx, conc in test_order:
                     # Skip cells that exceed token budget
-                    cell_total = conc * (ctx + args.max_tokens)
-                    if args.max_total_tokens > 0 and cell_total > args.max_total_tokens:
+                    if args.max_total_tokens > 0 and _should_skip(ctx, conc):
                         state.results[(ctx, conc)] = -1  # mark as skipped
                         cell = CellResult(concurrency=conc, context_tokens=ctx, aggregate_tps=-1)
                         all_results.append(cell)
