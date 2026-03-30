@@ -324,84 +324,91 @@ async def stream_one_request(
     shared_token_count: list,
     shared_active_streams: list = None,
 ) -> StreamResult:
+    """Stream requests in a loop until cancel_event. When a request finishes
+    (hits max_tokens or EOS), immediately start a new one to keep concurrency
+    saturated. Returns aggregate stats across all iterations."""
     result = StreamResult()
     t_start = time.monotonic()
     t_first = None
-    char_count = 0
-    chunk_count = 0
-    usage_tokens = None
+    total_chunks = 0
+    total_usage_tokens = 0
+    iterations = 0
+    active_signaled = False
 
-    try:
-        async with client.stream("POST", url, json=payload, timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
-            if resp.status_code != 200:
-                body = await resp.aread()
-                result.error = f"HTTP {resp.status_code}: {body.decode()[:200]}"
-                result.total_time = time.monotonic() - t_start
-                return result
-
-            async for line in resp.aiter_lines():
-                if cancel_event.is_set():
+    while not cancel_event.is_set():
+        usage_tokens = None
+        try:
+            async with client.stream("POST", url, json=payload, timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    result.error = f"HTTP {resp.status_code}: {body.decode()[:200]}"
                     break
 
-                if not line or not line.startswith("data: "):
-                    continue
+                async for line in resp.aiter_lines():
+                    if cancel_event.is_set():
+                        break
 
-                data_str = line[6:]
-                if data_str == "[DONE]":
-                    break
+                    if not line or not line.startswith("data: "):
+                        continue
 
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
 
-                # Check for usage in final chunk (stream_options.include_usage)
-                usage = data.get("usage")
-                if usage and "completion_tokens" in usage:
-                    usage_tokens = usage["completion_tokens"]
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
 
-                if "choices" not in data or len(data["choices"]) == 0:
-                    continue
+                    # Check for usage in final chunk (stream_options.include_usage)
+                    usage = data.get("usage")
+                    if usage and "completion_tokens" in usage:
+                        usage_tokens = usage["completion_tokens"]
 
-                delta = data["choices"][0].get("delta", {})
-                text = ""
+                    if "choices" not in data or len(data["choices"]) == 0:
+                        continue
 
-                reasoning = delta.get("reasoning") or delta.get("reasoning_content")
-                if reasoning:
-                    text += reasoning
+                    delta = data["choices"][0].get("delta", {})
+                    text = ""
 
-                content = delta.get("content")
-                if content:
-                    text += content
+                    reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                    if reasoning:
+                        text += reasoning
 
-                if text:
-                    if t_first is None:
-                        t_first = time.monotonic()
-                        if shared_active_streams is not None:
+                    content = delta.get("content")
+                    if content:
+                        text += content
+
+                    if text:
+                        if t_first is None:
+                            t_first = time.monotonic()
+                        if not active_signaled and shared_active_streams is not None:
                             shared_active_streams[0] += 1
-                    char_count += len(text)
-                    chunk_count += 1
-                    # Each SSE chunk = 1 token (verified on vLLM and SGLang)
-                    shared_token_count[0] += 1
+                            active_signaled = True
+                        total_chunks += 1
+                        shared_token_count[0] += 1
 
-    except httpx.ReadTimeout:
-        result.error = "ReadTimeout"
-    except httpx.ConnectError as e:
-        result.error = f"ConnectError: {e}"
-    except httpx.RemoteProtocolError as e:
-        result.error = f"ProtocolError: {e}"
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        result.error = f"{type(e).__name__}: {e}"
+        except httpx.ReadTimeout:
+            result.error = "ReadTimeout"
+            break
+        except httpx.ConnectError as e:
+            result.error = f"ConnectError: {e}"
+            break
+        except httpx.RemoteProtocolError as e:
+            result.error = f"ProtocolError: {e}"
+            break
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            result.error = f"{type(e).__name__}: {e}"
+            break
+
+        if usage_tokens is not None:
+            total_usage_tokens += usage_tokens
+        iterations += 1
 
     t_end = time.monotonic()
-    # Use server-reported usage if available, else estimate from chars
-    if usage_tokens is not None:
-        result.total_tokens = usage_tokens
-    else:
-        # Fallback: 1 SSE chunk = 1 token
-        result.total_tokens = chunk_count
+    result.total_tokens = total_usage_tokens if total_usage_tokens > 0 else total_chunks
     result.total_time = t_end - t_start
     if t_first is not None:
         result.ttft = t_first - t_start
@@ -1677,8 +1684,8 @@ def parse_args():
         help="Duration per test cell in seconds (default: 30)"
     )
     parser.add_argument(
-        "--max-tokens", type=int, default=8192,
-        help="Max tokens to generate per request (default: 8192)"
+        "--max-tokens", type=int, default=2048,
+        help="Max tokens to generate per request (default: 2048)"
     )
     parser.add_argument(
         "--output", default="benchmark_results.json",
