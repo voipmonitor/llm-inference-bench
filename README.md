@@ -87,6 +87,37 @@ Results are saved as JSON with metadata and per-cell throughput data:
 }
 ```
 
+## Additional tools
+
+### `llm_cjk_watchdog.py` — CJK character leak detector
+
+A standalone streaming watchdog that runs chat completions against any OpenAI-compatible endpoint and watches for unexpected Chinese / CJK Han ideographs in the output. Useful for catching model drift, KV-cache corruption, quantization damage, or other failure modes where an English task starts emitting Chinese tokens.
+
+```bash
+# single shot against local SGLang/vLLM on :5000
+python3 llm_cjk_watchdog.py
+
+# loop until the model leaks a Chinese character
+python3 llm_cjk_watchdog.py --loop
+
+# remote OpenAI-compatible endpoint
+python3 llm_cjk_watchdog.py --host https://api.together.xyz \
+    --api-key $TOGETHER_API_KEY --model meta-llama/llama-3-70b
+
+# simulate a 40k-token input context
+python3 llm_cjk_watchdog.py --context-tokens 40000 --max-tokens 2000
+```
+
+Features:
+
+- **Loop mode** — runs indefinitely, aborts the stream the moment a CJK character appears
+- **Two-row live overlay** pinned to the bottom of the terminal: row 1 shows the current iteration's live tok/s, tokens, elapsed time, and CJK counter; row 2 shows last-iteration and cumulative stats so they never scroll away
+- **Precise tok/s** — uses `stream_options.continuous_usage_stats` so the live readout is the exact `completion_tokens` reported by the server, not an estimate from chunk counts
+- **Padding context** — optional synthetic input of configurable token size to reproduce long-context failure modes
+- **Exit code 2** when CJK characters are detected (scripting-friendly)
+
+Requires only `requests`. See `python3 llm_cjk_watchdog.py --help` for the full CLI.
+
 ## License
 
 MIT
