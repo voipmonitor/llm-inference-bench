@@ -46,7 +46,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.3.0"
+VERSION = "0.4.3-effective-concurrency"
 
 CHARS_PER_TOKEN = 4
 
@@ -120,9 +120,13 @@ class CellResult:
     # Queue / effective concurrency tracking
     avg_running_reqs: float = 0.0
     max_running_reqs: int = 0
+    effective_concurrency: float = 0.0
     avg_queue_reqs: float = 0.0
     max_queue_reqs: int = 0
     queue_fraction: float = 0.0  # fraction of samples where queue > 0
+    underfilled: bool = False
+    warmup_timed_out: bool = False
+    capacity_limited: bool = False
 
 
 @dataclass
@@ -154,7 +158,7 @@ class TUIState:
     # Results
     results: dict = field(default_factory=dict)  # (ctx, conc) -> aggregate_tps
     errors: dict = field(default_factory=dict)   # (ctx, conc) -> num_errors
-    queue_info: dict = field(default_factory=dict)  # (ctx, conc) -> (avg_running, avg_queue)
+    queue_info: dict = field(default_factory=dict)  # (ctx, conc) -> (avg_running, avg_queue, capacity_limited)
     concurrency_levels: list = field(default_factory=list)
     context_lengths: list = field(default_factory=list)
     # Prefill results: ctx -> {ttft, tok_per_sec}
@@ -435,6 +439,7 @@ async def run_one_cell(
     live: Live,
     engine: str = ENGINE_SGLANG,
     auth_headers: dict = None,
+    ignore_eos: bool = True,
 ) -> CellResult:
     messages = build_messages(context_tokens, context_text)
     payload = {
@@ -444,6 +449,8 @@ async def run_one_cell(
         "max_tokens": max_tokens,
         "stream_options": {"include_usage": True},
     }
+    if ignore_eos:
+        payload["ignore_eos"] = True
 
     url = f"{base_url}/v1/chat/completions"
     cancel_event = asyncio.Event()
@@ -477,6 +484,8 @@ async def run_one_cell(
             "stream": True,
             "max_tokens": 1,
         }
+        if ignore_eos:
+            scout_payload["ignore_eos"] = True
         try:
             async with client.stream("POST", url, json=scout_payload,
                                      timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
@@ -511,8 +520,12 @@ async def run_one_cell(
     # Dynamic warmup: wait until all requests are in decode (queue == 0)
     warmup_done = False
     warmup_stable_since = None  # time when queue first hit 0 after min_warmup
+    warmup_timed_out = False
     measurement_start = None    # reset timer after warmup for full duration measurement
+    measurement_end = None
     measurement_tokens_start = 0  # token count at measurement start (for client-side fallback)
+    measurement_gen_tokens_start = None  # vLLM generation_tokens counter at measurement start
+    measurement_gen_tokens_end = None
 
     while True:
         await asyncio.sleep(0.5)
@@ -571,17 +584,28 @@ async def run_one_cell(
                             warmup_done = True
                             state.cell_warmup = False
                             measurement_start = now
+                            measurement_end = None
                             state.cell_measurement_start = now
                             measurement_tokens_start = shared_token_count[0]
+                            if engine == ENGINE_VLLM:
+                                measurement_gen_tokens_start = extract_metric(
+                                    metrics, metric_name(engine, "gen_tokens_total")
+                                )
                     else:
                         warmup_stable_since = None
                     # Give up after max_warmup — queue never drained (real capacity issue)
                     if elapsed >= max_warmup_seconds:
+                        warmup_timed_out = True
                         warmup_done = True
                         state.cell_warmup = False
                         measurement_start = now
+                        measurement_end = None
                         state.cell_measurement_start = now
                         measurement_tokens_start = shared_token_count[0]
+                        if engine == ENGINE_VLLM:
+                            measurement_gen_tokens_start = extract_metric(
+                                metrics, metric_name(engine, "gen_tokens_total")
+                            )
 
             # Collect samples only after warmup is done
             if warmup_done:
@@ -606,6 +630,12 @@ async def run_one_cell(
         # Check duration (measured from after warmup completes)
         measure_elapsed = (now - measurement_start) if measurement_start else 0
         if measurement_start and measure_elapsed >= duration:
+            if engine == ENGINE_VLLM and measurement_gen_tokens_start is not None:
+                end_metrics = await scrape_metrics(client, base_url)
+                measurement_gen_tokens_end = extract_metric(
+                    end_metrics, metric_name(engine, "gen_tokens_total")
+                )
+                measurement_end = time.monotonic()
             cancel_event.set()
             break
 
@@ -649,12 +679,31 @@ async def run_one_cell(
     if final_gen_throughput > 0:
         gen_throughput_samples.append(final_gen_throughput)
 
-    # Use server-side gen_throughput as the primary metric (median for robustness)
-    avg_gen_throughput = median(gen_throughput_samples) if gen_throughput_samples else 0.0
+    # Use an exact vLLM generation_tokens_total delta over the measured window
+    # as the primary decode metric. The previous implementation used the median
+    # of 1s counter rates, which is robust for display but can bias short runs.
+    exact_server_tokens = 0
+    exact_server_throughput = 0.0
+    if (
+        engine == ENGINE_VLLM
+        and measurement_gen_tokens_start is not None
+        and measurement_gen_tokens_end is not None
+        and measurement_end is not None
+        and measurement_end > measurement_start
+    ):
+        exact_server_tokens = max(
+            0,
+            int(round(measurement_gen_tokens_end - measurement_gen_tokens_start)),
+        )
+        exact_server_throughput = exact_server_tokens / (measurement_end - measurement_start)
+
+    avg_gen_throughput = exact_server_throughput
+    if avg_gen_throughput == 0:
+        avg_gen_throughput = median(gen_throughput_samples) if gen_throughput_samples else 0.0
 
     # Client-side stats
     successful = [r for r in stream_results if r.error is None]
-    total_tokens = sum(r.total_tokens for r in stream_results)
+    total_tokens = exact_server_tokens if exact_server_tokens > 0 else sum(r.total_tokens for r in stream_results)
 
     # Client-side fallback: only when server metrics give 0 (vLLM V1 missing gauge
     # and counter not updating in real-time).
@@ -676,6 +725,23 @@ async def run_one_cell(
     max_queue = max(queue_reqs_samples) if queue_reqs_samples else 0
     queued_count = sum(1 for q in queue_reqs_samples if q > 0)
     queue_frac = queued_count / len(queue_reqs_samples) if queue_reqs_samples else 0.0
+    has_scheduler_samples = bool(running_reqs_samples) and (max_running > 0 or max_queue > 0)
+    # A cell can be queue-free but still invalid for the requested concurrency:
+    # vLLM may only admit the subset that fits in KV cache, then report queue=0
+    # once the rejected/waiting work has drained. Track the effective concurrency
+    # separately so headline tables do not mistake overload behavior for speed.
+    underfilled = (
+        concurrency > 1
+        and has_scheduler_samples
+        and avg_running < concurrency * 0.98
+    )
+    capacity_limited = (
+        warmup_timed_out
+        or (concurrency > 1 and has_scheduler_samples and max_running < concurrency)
+        or (concurrency > 1 and has_scheduler_samples and avg_running < concurrency * 0.95)
+        or avg_queue > 0
+        or queue_frac > 0
+    )
 
     cell = CellResult(
         concurrency=concurrency,
@@ -689,20 +755,28 @@ async def run_one_cell(
         wall_time=wall_time,
         num_completed=len(successful),
         num_errors=len(stream_results) - len(successful),
-        server_gen_throughput=median(gen_throughput_samples) if gen_throughput_samples else 0.0,
+        server_gen_throughput=exact_server_throughput or (median(gen_throughput_samples) if gen_throughput_samples else 0.0),
         server_utilization=extract_metric(metrics, metric_name(engine, "utilization")),
         server_spec_accept_rate=extract_metric(metrics, metric_name(engine, "spec_accept_rate")),
         avg_running_reqs=round(avg_running, 1),
         max_running_reqs=max_running,
+        effective_concurrency=round(avg_running, 1),
         avg_queue_reqs=round(avg_queue, 1),
         max_queue_reqs=max_queue,
         queue_fraction=round(queue_frac, 3),
+        underfilled=underfilled,
+        warmup_timed_out=warmup_timed_out,
+        capacity_limited=capacity_limited,
     )
 
     state.cell_running = False
     state.results[(context_tokens, concurrency)] = cell.aggregate_tps
     state.errors[(context_tokens, concurrency)] = cell.num_errors
-    state.queue_info[(context_tokens, concurrency)] = (cell.avg_running_reqs, cell.avg_queue_reqs)
+    state.queue_info[(context_tokens, concurrency)] = (
+        cell.avg_running_reqs,
+        cell.avg_queue_reqs,
+        cell.capacity_limited,
+    )
 
     await cell_client.aclose()
     return cell
@@ -728,17 +802,17 @@ def build_display(state: TUIState) -> Layout:
     # Header
     header_text = Text()
     engine_label = state.engine.upper() if state.engine else "Benchmark"
-    header_text.append(f"{engine_label} Benchmark", style="bold cyan")
+    header_text.append(f"{engine_label} Benchmark", style="bold bright_yellow")
     header_text.append(f"  {state.model_name} @ {state.server_url}")
     header_text.append(f"  |  {state.total_tests} tests  |  {state.cell_duration:.0f}s each")
     if state.kv_cache_budget > 0 or state.max_running_requests > 0:
         header_text.append("  |  ", style="dim")
         if state.kv_cache_budget > 0:
-            header_text.append(f"KV: {state.kv_cache_budget:,}", style="cyan")
+            header_text.append(f"KV: {state.kv_cache_budget:,}", style="bright_cyan")
         if state.max_running_requests > 0:
             if state.kv_cache_budget > 0:
                 header_text.append("  ", style="dim")
-            header_text.append(f"MaxReqs: {state.max_running_requests}", style="cyan")
+            header_text.append(f"MaxReqs: {state.max_running_requests}", style="bright_cyan")
         if state.skipped_cells > 0:
             header_text.append(f"  ({state.skipped_cells} skipped)", style="yellow")
     layout["header"].update(Panel(header_text, style="bold"))
@@ -748,7 +822,7 @@ def build_display(state: TUIState) -> Layout:
         elapsed = time.monotonic() - state.cell_start
         if state.prefill_phase:
             cell_text = (
-                f"[bold magenta]PREFILL[/bold magenta]  ctx={format_context(state.current_context)}\n"
+                f"[bold bright_yellow]PREFILL[/bold bright_yellow]  ctx={format_context(state.current_context)}\n"
                 f"  Elapsed: {elapsed:.1f}s\n"
                 f"  Populating radix cache...\n"
                 f"  Test [bold]{state.completed_tests + 1}[/bold] of {state.total_tests}"
@@ -766,7 +840,7 @@ def build_display(state: TUIState) -> Layout:
                     wait_reason = "stabilizing..."
                 cell_text = (
                     f"[bold]DECODE[/bold]  C={state.current_concurrency}, ctx={format_context(state.current_context)}"
-                    f"  [magenta]RAMP-UP[/magenta]\n"
+                    f"  [bright_yellow]RAMP-UP[/bright_yellow]\n"
                     f"  {wait_reason} {elapsed:.0f}s\n"
                     f"  Server: [bold yellow]{state.cell_live_tps:.1f}[/bold yellow] tok/s  "
                     f"running={state.srv_running_reqs} queue={state.srv_queue_reqs}\n"
@@ -788,7 +862,7 @@ def build_display(state: TUIState) -> Layout:
                 )
     else:
         cell_text = "[dim]Waiting...[/dim]"
-    layout["current_test"].update(Panel(cell_text, title="Current Test", border_style="cyan"))
+    layout["current_test"].update(Panel(cell_text, title="Current Test", border_style="bright_cyan"))
 
     # Server metrics panel
     srv_table = Table(show_header=False, box=None, padding=(0, 1))
@@ -800,11 +874,11 @@ def build_display(state: TUIState) -> Layout:
     srv_table.add_row("utilization", f"{state.srv_utilization:.2%}")
     srv_table.add_row("spec_accept_rate", f"{state.srv_spec_accept_rate:.2%}")
     srv_table.add_row("spec_accept_len", f"{state.srv_spec_accept_length:.1f}")
-    layout["server_metrics"].update(Panel(srv_table, title="Server Metrics", border_style="magenta"))
+    layout["server_metrics"].update(Panel(srv_table, title="Server Metrics", border_style="bright_yellow"))
 
     # Results table
-    results_table = Table(title="Aggregate Throughput (tok/s)", border_style="green", expand=True)
-    results_table.add_column("ctx \\ conc", style="bold cyan", min_width=8)
+    results_table = Table(title="Aggregate Throughput (tok/s)", border_style="bright_blue", expand=True)
+    results_table.add_column("ctx \\ conc", style="bold bright_cyan", min_width=8)
     for conc in state.concurrency_levels:
         results_table.add_column(str(conc), justify="right", min_width=10)
 
@@ -839,11 +913,15 @@ def build_display(state: TUIState) -> Layout:
                 cell = f"{val:.1f}"
                 if errs > 0:
                     cell += f" [red]({errs}e)[/red]"
-                # Show running/requested when queuing detected
+                # Show running/requested when scheduler did not sustain the
+                # requested concurrency. This catches vLLM KV-capacity cases
+                # where queue drains to zero after only a subset is admitted.
                 qi = state.queue_info.get(key)
-                if qi and qi[1] > 0:
-                    avg_run, avg_q = qi
-                    cell += f" [magenta]({avg_run:.0f}/{conc})[/magenta]"
+                if qi:
+                    avg_run, avg_q, limited = qi
+                    if limited or avg_q > 0 or (avg_run > 0 and avg_run < conc * 0.98):
+                        mark = "*" if limited else ""
+                        cell += f" [bright_yellow]({avg_run:.0f}/{conc}){mark}[/bright_yellow]"
                 row.append(f"[{style}]{cell}[/{style}]")
             else:
                 row.append("[dim]...[/dim]")
@@ -851,8 +929,8 @@ def build_display(state: TUIState) -> Layout:
 
     # Prefill table (shown alongside decode results)
     if state.prefill_contexts:
-        prefill_table = Table(title="Prefill (C=1)", border_style="magenta", expand=True)
-        prefill_table.add_column("ctx", style="bold cyan")
+        prefill_table = Table(title="Prefill (C=1)", border_style="bright_yellow", expand=True)
+        prefill_table.add_column("ctx", style="bold bright_cyan")
         prefill_table.add_column("TTFT", justify="right")
         prefill_table.add_column("tok/s", justify="right")
         prefill_table.add_column("N", justify="right")
@@ -1038,57 +1116,148 @@ async def run_benchmark(args):
     prefill_contexts = [c for c in PREFILL_CANDIDATES if c <= max_prefill]
     if not prefill_contexts and max_prefill > 0:
         prefill_contexts = [max_prefill]
-    console.print(f"[cyan]Prefill tests:[/cyan] {[format_context(c) for c in prefill_contexts]}")
+    if args.skip_prefill:
+        prefill_contexts = []
+        console.print("[cyan]Prefill tests:[/cyan] skipped")
+    else:
+        console.print(f"[cyan]Prefill tests:[/cyan] {[format_context(c) for c in prefill_contexts]}")
 
     # --- Step 3: Generate padding text calibrated to actual token counts ---
-    # Calibrate chars_per_token ratio once on a small context (~8k), then extrapolate.
-    # This avoids sending huge requests (128k+) just for calibration.
+    # Prefer vLLM's /tokenize endpoint so context labels mean real prompt tokens.
+    # Fallback to the older chars/token probe for servers that do not expose it.
     all_ctx_sizes = sorted(set(prefill_contexts + [c for c in context_lengths if c > 0]))
     max_ctx = max(all_ctx_sizes) if all_ctx_sizes else 0
     context_cache = {}
+    context_actual_tokens = {}
     run_id = ''.join(random.choices(string.ascii_lowercase, k=12))
     if max_ctx > 0:
         console.print(f"[bold]Calibrating padding text (run={run_id}, up to {format_context(max_ctx)})...[/bold]")
-        base_text = generate_padding_text(int(max_ctx * 1.5))
+        base_text = generate_padding_text(int(max_ctx * 3))
 
-        # Calibrate on small context: send ~8k tokens, measure actual, derive ratio
-        calibrated_cpt = CHARS_PER_TOKEN
-        cal_ctx = min(8192, max_ctx)
-        async with httpx.AsyncClient(headers=auth_headers) as cal_client:
-            prefix = f"[BENCH_{run_id}_CAL] "
-            for attempt in range(3):
-                target_chars = int(cal_ctx * calibrated_cpt)
-                cal_text = (prefix + base_text)[:target_chars]
-                msgs = build_messages(cal_ctx, cal_text)
-                payload = {
-                    "model": args.model, "messages": msgs,
-                    "stream": False, "max_tokens": 1,
-                    "stream_options": {"include_usage": True},
-                }
-                try:
-                    resp = await cal_client.post(
-                        f"{base_url}/v1/chat/completions",
-                        json=payload,
-                        timeout=httpx.Timeout(120.0, connect=30.0),
-                    )
-                    data = resp.json()
-                    actual = data.get("usage", {}).get("prompt_tokens", 0)
-                    if actual > 0:
-                        calibrated_cpt = len(cal_text) / actual
-                        if abs(actual - cal_ctx) / cal_ctx < 0.05:
-                            break
-                except Exception:
-                    break
-        console.print(f"  Calibrated: {calibrated_cpt:.2f} chars/token (from {format_context(cal_ctx)} probe)")
+        def ensure_base_chars(min_chars: int) -> None:
+            nonlocal base_text
+            if len(base_text) < min_chars:
+                base_text = generate_padding_text(max(int(min_chars / CHARS_PER_TOKEN) + 1024, max_ctx * 3))
 
-        # Generate text for each context size using calibrated ratio
-        for ctx in all_ctx_sizes:
+        async def tokenize_context_text(client: httpx.AsyncClient, ctx: int, text: str) -> int:
+            resp = await client.post(
+                f"{base_url}/tokenize",
+                json={"model": args.model, "messages": build_messages(ctx, text)},
+                timeout=httpx.Timeout(120.0, connect=30.0),
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            count = int(data.get("count", 0))
+            if count <= 0:
+                raise ValueError(f"/tokenize returned invalid count: {data}")
+            return count
+
+        async def build_exact_context_text(client: httpx.AsyncClient, ctx: int) -> tuple[str, int]:
             prefix = f"[BENCH_{run_id}_CTX_{ctx}] "
-            target_chars = int(ctx * calibrated_cpt)
-            text = (prefix + base_text)[:target_chars]
-            context_cache[ctx] = text
-            est_tokens = int(len(text) / calibrated_cpt)
-            console.print(f"  {format_context(ctx)}: {len(text):,} chars (~{est_tokens:,} tokens)")
+
+            def text_for(total_chars: int) -> str:
+                ensure_base_chars(max(0, total_chars - len(prefix)))
+                return (prefix + base_text)[:total_chars]
+
+            low = 0
+            high = max(1024, ctx * 8)
+            best_chars = low
+            best_count = await tokenize_context_text(client, ctx, text_for(low))
+            max_high = max(high, ctx * 32)
+
+            while True:
+                count = await tokenize_context_text(client, ctx, text_for(high))
+                if abs(count - ctx) < abs(best_count - ctx):
+                    best_chars, best_count = high, count
+                if count >= ctx:
+                    break
+                low = high
+                high *= 2
+                if high > max_high:
+                    raise RuntimeError(
+                        f"Could not reach {format_context(ctx)} via /tokenize "
+                        f"(last {count:,} tokens at {low:,} chars)"
+                    )
+
+            while low + 1 < high:
+                mid = (low + high) // 2
+                count = await tokenize_context_text(client, ctx, text_for(mid))
+                if abs(count - ctx) < abs(best_count - ctx):
+                    best_chars, best_count = mid, count
+                if count < ctx:
+                    low = mid
+                else:
+                    high = mid
+
+            for candidate in (low, high):
+                count = await tokenize_context_text(client, ctx, text_for(candidate))
+                if abs(count - ctx) < abs(best_count - ctx):
+                    best_chars, best_count = candidate, count
+
+            tolerance = max(64, int(ctx * 0.005))
+            if abs(best_count - ctx) > tolerance:
+                raise RuntimeError(
+                    f"Could not build {format_context(ctx)} prompt accurately: "
+                    f"got {best_count:,} tokens at {best_chars:,} chars"
+                )
+            return text_for(best_chars), best_count
+
+        async with httpx.AsyncClient(headers=auth_headers) as cal_client:
+            try:
+                for ctx in all_ctx_sizes:
+                    text, actual = await build_exact_context_text(cal_client, ctx)
+                    context_cache[ctx] = text
+                    context_actual_tokens[ctx] = actual
+                    console.print(
+                        f"  {format_context(ctx)}: {len(text):,} chars "
+                        f"({actual:,} prompt tokens via /tokenize)"
+                    )
+                console.print("  Token targeting: /tokenize exact")
+            except Exception as e:
+                console.print(f"[yellow]  /tokenize calibration failed, falling back to chars/token probe: {e}[/yellow]")
+                context_cache.clear()
+                context_actual_tokens.clear()
+
+        if not context_cache:
+            # Calibrate on small context: send ~8k tokens, measure actual, derive ratio
+            calibrated_cpt = CHARS_PER_TOKEN
+            cal_ctx = min(8192, max_ctx)
+            async with httpx.AsyncClient(headers=auth_headers) as cal_client:
+                prefix = f"[BENCH_{run_id}_CAL] "
+                for attempt in range(3):
+                    target_chars = int(cal_ctx * calibrated_cpt)
+                    cal_text = (prefix + base_text)[:target_chars]
+                    msgs = build_messages(cal_ctx, cal_text)
+                    payload = {
+                        "model": args.model, "messages": msgs,
+                        "stream": False, "max_tokens": 1,
+                    }
+                    try:
+                        resp = await cal_client.post(
+                            f"{base_url}/v1/chat/completions",
+                            json=payload,
+                            timeout=httpx.Timeout(120.0, connect=30.0),
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        actual = data.get("usage", {}).get("prompt_tokens", 0)
+                        if actual > 0:
+                            calibrated_cpt = len(cal_text) / actual
+                            if abs(actual - cal_ctx) / cal_ctx < 0.05:
+                                break
+                    except Exception:
+                        break
+            console.print(f"  Calibrated: {calibrated_cpt:.2f} chars/token (from {format_context(cal_ctx)} probe)")
+
+            # Generate text for each context size using calibrated ratio
+            for ctx in all_ctx_sizes:
+                prefix = f"[BENCH_{run_id}_CTX_{ctx}] "
+                target_chars = int(ctx * calibrated_cpt)
+                ensure_base_chars(max(0, target_chars - len(prefix)))
+                text = (prefix + base_text)[:target_chars]
+                context_cache[ctx] = text
+                est_tokens = int(len(text) / calibrated_cpt)
+                console.print(f"  {format_context(ctx)}: {len(text):,} chars (~{est_tokens:,} tokens)")
     context_cache[0] = ""
     console.print("[green]Done.[/green]\n")
 
@@ -1134,9 +1303,7 @@ async def run_benchmark(args):
                     state.results[(ctx, conc)] = -1
 
     # Add prefill tests to total count (unless skipped)
-    if args.skip_prefill:
-        prefill_contexts = []
-        state.prefill_contexts = []
+    state.prefill_contexts = prefill_contexts
     state.total_tests += len(prefill_contexts)
 
     # Run benchmark
@@ -1221,8 +1388,12 @@ async def run_benchmark(args):
                 # Warmup 2: prefill with smallest test context (triggers prefill CUDA graphs)
                 warmup_ctx = prefill_contexts[0]
                 warmup_prefix = f"[WARMUP_{run_id}] "
-                warmup_text = warmup_prefix + (context_cache.get(warmup_ctx, "") or generate_padding_text(warmup_ctx))
-                warmup_text = warmup_text[:warmup_ctx * CHARS_PER_TOKEN]
+                cached_warmup_text = context_cache.get(warmup_ctx, "") or generate_padding_text(warmup_ctx)
+                cached_prefix = f"[BENCH_{run_id}_CTX_{warmup_ctx}] "
+                if cached_warmup_text.startswith(cached_prefix):
+                    warmup_text = warmup_prefix + cached_warmup_text[len(cached_prefix):]
+                else:
+                    warmup_text = warmup_prefix + cached_warmup_text
                 warmup_msgs = build_messages(warmup_ctx, warmup_text)
                 await measure_ttft(client, warmup_msgs)
 
@@ -1336,6 +1507,34 @@ async def run_benchmark(args):
             state.prefill_phase = False
             first_conc = concurrency_levels[0]
             first_ctx = context_lengths[0]
+
+            # Optional hidden decode warmup. The short probe above is enough for
+            # basic JIT compilation, but long-running speculative stacks can still
+            # under-report the first measured decode cell. This runs the first
+            # decode shape without recording it, then clears the transient TUI state.
+            if args.decode_warmup_seconds > 0:
+                await run_one_cell(
+                    client=client,
+                    base_url=base_url,
+                    concurrency=first_conc,
+                    context_tokens=first_ctx,
+                    context_text=context_cache[first_ctx],
+                    duration=args.decode_warmup_seconds,
+                    max_tokens=args.max_tokens,
+                    model=args.model,
+                    state=state,
+                    live=live,
+                    engine=engine,
+                    auth_headers=auth_headers,
+                    ignore_eos=not args.respect_eos,
+                )
+                state.results.pop((first_ctx, first_conc), None)
+                state.errors.pop((first_ctx, first_conc), None)
+                state.queue_info.pop((first_ctx, first_conc), None)
+                state.cell_running = False
+                live.update(build_display(state))
+                await asyncio.sleep(2.0)
+
             test_order = []
             # 1) First column: C=first, all contexts
             for ctx in context_lengths:
@@ -1377,6 +1576,7 @@ async def run_benchmark(args):
                             live=live,
                             engine=engine,
                             auth_headers=auth_headers,
+                            ignore_eos=not args.respect_eos,
                         )
                         if result.aggregate_tps == -2:
                             state.results[(ctx, conc)] = -2
@@ -1409,12 +1609,19 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                         console: Console, prefill_results: dict = None):
     console.print("\n")
 
+    def needs_effective_note(r: CellResult, requested: int) -> bool:
+        return (
+            r.capacity_limited
+            or r.avg_queue_reqs > 0
+            or (r.avg_running_reqs > 0 and r.avg_running_reqs < requested * 0.98)
+        )
+
     # Prefill table
     if prefill_results:
         baseline = next(iter(prefill_results.values()), {}).get("baseline", 0)
         pt = Table(title=f"Prefill Speed (C=1, baseline TTFT={baseline:.3f}s subtracted)",
-                   border_style="magenta")
-        pt.add_column("Context", style="bold cyan")
+                   border_style="bright_yellow")
+        pt.add_column("Context", style="bold bright_cyan")
         pt.add_column("Tokens", justify="right")
         pt.add_column("TTFT (s)", justify="right")
         pt.add_column("Prefill (s)", justify="right")
@@ -1435,13 +1642,13 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         console.print()
 
     # Aggregate throughput table
-    table = Table(title="Aggregate Throughput (tok/s)", border_style="green")
-    table.add_column("ctx \\ conc", style="bold cyan")
+    table = Table(title="Aggregate Throughput (tok/s)", border_style="bright_blue")
+    table.add_column("ctx \\ conc", style="bold bright_cyan")
     for conc in concurrency_levels:
         table.add_column(str(conc), justify="right")
 
     result_map = {(r.context_tokens, r.concurrency): r for r in results}
-    any_queued = any(r.avg_queue_reqs > 0 for r in results if r.aggregate_tps >= 0)
+    any_limited = any(needs_effective_note(r, r.concurrency) for r in results if r.aggregate_tps >= 0)
 
     for ctx in context_lengths:
         row = [format_context(ctx)]
@@ -1453,20 +1660,21 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 val = f"{r.aggregate_tps:.1f}"
                 if r.num_errors > 0:
                     val += f" ({r.num_errors}e)"
-                if r.avg_queue_reqs > 0:
-                    val += f" ({r.avg_running_reqs:.0f}/{conc})"
+                if needs_effective_note(r, conc):
+                    mark = "*" if r.capacity_limited else ""
+                    val += f" ({r.avg_running_reqs:.0f}/{conc}){mark}"
                 row.append(val)
             else:
                 row.append("-")
         table.add_row(*row)
 
     console.print(table)
-    if any_queued:
-        console.print("[dim](X/Y) = avg running / requested concurrency — requests were queued[/dim]")
+    if any_limited:
+        console.print("[dim](X/Y) = avg running / requested concurrency from Prometheus; * = capacity-limited or warmup timed out[/dim]")
 
     # Per-request avg tok/s table
-    table2 = Table(title="Per-Request Avg Throughput (tok/s)", border_style="blue")
-    table2.add_column("ctx \\ conc", style="bold cyan")
+    table2 = Table(title="Per-Request Avg Throughput (tok/s)", border_style="bright_magenta")
+    table2.add_column("ctx \\ conc", style="bold bright_cyan")
     for conc in concurrency_levels:
         table2.add_column(str(conc), justify="right")
 
@@ -1478,8 +1686,9 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 row.append("skip")
             elif r and r.per_request_avg_tps > 0:
                 val = f"{r.per_request_avg_tps:.1f}"
-                if r.avg_queue_reqs > 0:
-                    val += f" ({r.avg_running_reqs:.0f}/{conc})"
+                if needs_effective_note(r, conc):
+                    mark = "*" if r.capacity_limited else ""
+                    val += f" ({r.avg_running_reqs:.0f}/{conc}){mark}"
                 row.append(val)
             else:
                 row.append("-")
@@ -1489,8 +1698,8 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
 
     # TTFT table
     table3 = Table(title=f"Avg TTFT (seconds)  [dim]llm-decode-bench v{VERSION}[/dim]",
-                   border_style="yellow")
-    table3.add_column("ctx \\ conc", style="bold cyan")
+                   border_style="bright_yellow")
+    table3.add_column("ctx \\ conc", style="bold bright_cyan")
     for conc in concurrency_levels:
         table3.add_column(str(conc), justify="right")
 
@@ -1539,7 +1748,9 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
             "server": args.host if args.host.startswith("http") else f"{args.host}:{args.port or 5000}",
             "timestamp": datetime.now().isoformat(),
             "duration_per_test": args.duration,
+            "decode_warmup_seconds": getattr(args, "decode_warmup_seconds", 0),
             "max_tokens": args.max_tokens,
+            "ignore_eos": not getattr(args, "respect_eos", False),
             "max_total_tokens": args.max_total_tokens,
             "concurrency_levels": concurrency_levels,
             "context_lengths": context_lengths,
@@ -1688,6 +1899,16 @@ def parse_args():
         help="Max tokens to generate per request (default: 2048)"
     )
     parser.add_argument(
+        "--decode-warmup-seconds", type=float, default=0.0,
+        help="Hidden decode warmup duration before measured decode cells. "
+             "Use 20 for short exact decode matrices on speculative stacks."
+    )
+    parser.add_argument(
+        "--respect-eos", action="store_true",
+        help="Respect model EOS while measuring decode. Default is ignore_eos=true "
+             "so decode cells are not contaminated by repeated short completions."
+    )
+    parser.add_argument(
         "--output", default="benchmark_results.json",
         help="Output JSON file path (default: benchmark_results.json)"
     )
@@ -1732,14 +1953,14 @@ def main():
     decode_count = len(concurrency_levels) * len(context_lengths)
 
     console.print(Panel(
-        f"[bold cyan]LLM Inference Benchmark[/bold cyan]\n"
+        f"[bold bright_yellow]LLM Inference Benchmark[/bold bright_yellow]\n"
         f"Model: {args.model} @ {args.host if args.host.startswith('http') else f'{args.host}:{args.port or 5000}'}\n"
         f"Decode concurrency: {concurrency_levels}\n"
         f"Decode contexts: {[format_context(c) for c in context_lengths]}\n"
         f"Duration: {args.duration}s per decode test | Max tokens: {args.max_tokens}\n"
         f"Phase 1: prefill (auto, up to 128k) | Phase 2: {decode_count} decode tests (cached)",
         title="Configuration",
-        border_style="cyan",
+        border_style="bright_yellow",
     ))
 
     engine = ""
