@@ -22,7 +22,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
 - **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling
 - **Effective concurrency detection** — shows `(X/Y)*` when the server cannot actually run all requested concurrent requests
-- **Dynamic warmup** — waits for Prometheus `running_reqs >= requested_concurrency` with an empty queue before measurement begins
+- **Dynamic warmup** — uses scheduler metrics when available, with an OpenAI stream fallback when `/metrics` is disabled
 - **JSON output** — structured results saved to `benchmark_results.json` for further analysis
 - **Smart test skipping** — reads KV cache budget from the server, automatically skips over-capacity cells
 - **Engine auto-detection** — automatically detects SGLang vs vLLM and adapts metric scraping
@@ -141,6 +141,12 @@ scheduler/effective-concurrency state, but they are not the default headline
 metric. If continuous usage is not available, the tool falls back to streamed
 content chunks and marks the aggregate source in JSON.
 
+Prometheus `/metrics` is optional. If SGLang is started without
+`--enable-metrics`, or if a remote server does not expose metrics, the benchmark
+prints a visible warning and continues with OpenAI stream metrics. In that mode,
+scheduler/effective-concurrency, KV auto-detection from metrics, and Prometheus
+validation fields are unavailable.
+
 Use this section as the main tuning/regression signal for kernels, NCCL, DCP,
 MTP, scheduler, and KV-cache changes. It answers: "How much decode throughput
 can the engine sustain once it is already running this concurrency?"
@@ -243,7 +249,7 @@ Results are saved as JSON with metadata and per-cell throughput data:
 ```json
 {
   "metadata": {
-    "version": "0.4.0",
+    "version": "0.4.1",
     "engine": "vllm",
     "model": "Qwen3_5-397B-A17B-NVFP4",
     "timestamp": "2026-03-13T00:30:53",

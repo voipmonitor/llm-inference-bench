@@ -52,7 +52,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -261,6 +261,8 @@ class TUIState:
     cell_request_latency_p50_ms: float = 0.0
     cell_request_latency_p90_ms: float = 0.0
     # Server metrics
+    metrics_available: bool = True
+    metrics_warning: str = ""
     srv_gen_throughput: float = 0.0
     srv_running_reqs: int = 0
     srv_queue_reqs: int = 0
@@ -947,18 +949,18 @@ def format_gib_from_mb(mb: float) -> str:
     return f"{mb / 1024:.1f}G"
 
 
-def render_hardware_panel(state: TUIState) -> Panel:
+def render_hardware_panel(state: TUIState, dense: bool = False) -> Panel:
     if not state.hw_available:
         msg = "Waiting for hardware samples..."
         if state.hw_last_error:
             msg = state.hw_last_error
         return Panel(
             f"[dim]{msg}[/dim]",
-            title=render_title("HARDWARE"),
+            title=render_title("HW" if dense else "HARDWARE"),
             title_align="left",
             box=PANEL_BOX,
             border_style=FRAME_BORDER,
-            padding=(0, 1),
+            padding=(0, 0 if dense else 1),
         )
 
     total_rx = sum(g.pcie_rx_mb_s for g in state.gpu_stats)
@@ -968,15 +970,16 @@ def render_hardware_panel(state: TUIState) -> Panel:
         cpu += f" {format_ghz(state.cpu_freq_mhz)}"
     age = time.monotonic() - state.hw_last_update if state.hw_last_update else 0
 
-    table = Table(show_header=True, box=None, padding=(0, 1), expand=True)
-    table.add_column("GPU", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+    table = Table(show_header=True, box=None, padding=(0, 0 if dense else 1), expand=True)
+    table.add_column("G" if dense else "GPU", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
     table.add_column("SM", justify="right", no_wrap=True)
-    table.add_column("Mem", justify="right", no_wrap=True)
+    table.add_column("MC" if dense else "Mem", justify="right", no_wrap=True)
     table.add_column("VRAM", justify="right", no_wrap=True)
-    table.add_column("W now/lim", justify="right", no_wrap=True)
+    table.add_column("W" if dense else "W now/lim", justify="right", no_wrap=True)
     table.add_column("T", justify="right", no_wrap=True)
-    table.add_column("Clk", justify="right", no_wrap=True)
-    table.add_column("PCIe rx/tx", justify="right", no_wrap=True)
+    if not dense:
+        table.add_column("Clk", justify="right", no_wrap=True)
+    table.add_column("PCIe" if dense else "PCIe rx/tx", justify="right", no_wrap=True)
 
     visible_gpus = state.gpu_stats[:max(1, state.hw_gpu_limit)]
     for gpu in visible_gpus:
@@ -995,23 +998,34 @@ def render_hardware_panel(state: TUIState) -> Panel:
         temp = colorize(f"{gpu.temp_c:.0f}C", color_temp(gpu.temp_c))
         clk = f"{format_ghz(gpu.sm_clock_mhz)}/{format_ghz(gpu.mem_clock_mhz)}"
         pcie = f"{gpu.pcie_rx_mb_s:.0f}/{gpu.pcie_tx_mb_s:.0f}"
-        table.add_row(f"G{gpu.index}", sm, mem, vram, power, temp, clk, pcie)
+        row = [f"G{gpu.index}", sm, mem, vram, power, temp]
+        if not dense:
+            row.append(clk)
+        row.append(pcie)
+        table.add_row(*row)
 
     hidden = len(state.gpu_stats) - len(visible_gpus)
     hidden_note = f"  [dim]+{hidden} hidden[/dim]" if hidden > 0 else ""
-    header = (
-        f"[dim]{cpu}  PCIe rx/tx[/dim] "
-        f"[{PHOSPHOR_DIM}]{total_rx:.0f}/{total_tx:.0f} MB/s[/{PHOSPHOR_DIM}]  "
-        f"[dim]age {age:.0f}s[/dim]{hidden_note}\n"
-        f"[dim]PCIe rx/tx are MB/s from nvidia-smi dmon; W color is current/limit ratio[/dim]"
-    )
+    if dense:
+        header = (
+            f"[dim]{cpu}  PCIe[/dim] "
+            f"[{PHOSPHOR_DIM}]{total_rx:.0f}/{total_tx:.0f} MB/s[/{PHOSPHOR_DIM}]  "
+            f"[dim]age {age:.0f}s[/dim]{hidden_note}"
+        )
+    else:
+        header = (
+            f"[dim]{cpu}  PCIe rx/tx[/dim] "
+            f"[{PHOSPHOR_DIM}]{total_rx:.0f}/{total_tx:.0f} MB/s[/{PHOSPHOR_DIM}]  "
+            f"[dim]age {age:.0f}s[/dim]{hidden_note}\n"
+            f"[dim]PCIe rx/tx are MB/s from nvidia-smi dmon; W color is current/limit ratio[/dim]"
+        )
     return Panel(
         Group(header, table),
-        title=render_title("HARDWARE"),
+        title=render_title("HW" if dense else "HARDWARE"),
         title_align="left",
         box=PANEL_BOX,
         border_style=FRAME_BORDER,
-        padding=(0, 1),
+        padding=(0, 0 if dense else 1),
     )
 
 
@@ -1504,6 +1518,12 @@ async def wait_server_idle(
     status: str = "",
 ) -> dict:
     """Wait until server reports no running or queued requests, then return metrics."""
+    if state is not None and not state.metrics_available:
+        if status:
+            state.prefill_status = f"{status} (metrics unavailable; using client timing)"
+            if live is not None:
+                live.update(build_display(state))
+        return {}
     deadline = time.monotonic() + timeout_seconds
     stable_since = None
     last_metrics = {}
@@ -1982,7 +2002,7 @@ async def run_one_cell(
         state.cell_request_latency_p50_ms = 0.0
         state.cell_request_latency_p90_ms = 0.0
 
-        start_metrics = await scrape_metrics(client, base_url)
+        start_metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
         measurement_gen_tokens_start = (
             extract_metric(start_metrics, metric_name(engine, "gen_tokens_total"))
             if engine == ENGINE_VLLM else None
@@ -2039,7 +2059,7 @@ async def run_one_cell(
                 state.cell_live_tps = batch_tokens[0] / elapsed
 
             if now - last_metrics_time > metrics_interval:
-                metrics = await scrape_metrics(client, base_url)
+                metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
                 if engine == ENGINE_SGLANG:
                     state.srv_gen_throughput = extract_metric(metrics, metric_name(engine, "gen_throughput"))
                 else:
@@ -2055,9 +2075,10 @@ async def run_one_cell(
                         prev_gen_tokens = gen_total
                         prev_gen_time = now
 
-                state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
-                state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
-                state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
+                if state.metrics_available:
+                    state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
+                    state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
+                    state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
                 if engine == ENGINE_SGLANG:
                     state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
                     state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
@@ -2079,8 +2100,9 @@ async def run_one_cell(
 
                 if state.srv_gen_throughput > 0:
                     gen_throughput_samples.append(state.srv_gen_throughput)
-                running_reqs_samples.append(state.srv_running_reqs)
-                queue_reqs_samples.append(state.srv_queue_reqs)
+                if state.metrics_available:
+                    running_reqs_samples.append(state.srv_running_reqs)
+                    queue_reqs_samples.append(state.srv_queue_reqs)
                 if state.cell_live_tps > 0:
                     state.cell_tps_history.append(state.cell_live_tps)
                     if len(state.cell_tps_history) > 240:
@@ -2118,7 +2140,7 @@ async def run_one_cell(
             request_samples.extend(stream_result.request_samples)
         update_state_request_stats(state, request_samples)
 
-        metrics = await scrape_metrics(client, base_url)
+        metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
         exact_server_tokens = 0
         if engine == ENGINE_VLLM and measurement_gen_tokens_start is not None:
             measurement_gen_tokens_end = extract_metric(metrics, metric_name(engine, "gen_tokens_total"))
@@ -2296,7 +2318,7 @@ async def run_one_cell(
 
         # Scrape server metrics periodically
         if now - last_metrics_time > metrics_interval:
-            metrics = await scrape_metrics(client, base_url)
+            metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
 
             # Throughput: SGLang has a gauge, vLLM needs rate from counter
             if engine == ENGINE_SGLANG:
@@ -2316,9 +2338,10 @@ async def run_one_cell(
                     prev_gen_tokens = gen_total
                     prev_gen_time = now
 
-            state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
-            state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
-            state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
+            if state.metrics_available:
+                state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
+                state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
+                state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
             if engine == ENGINE_SGLANG:
                 state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
                 state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
@@ -2361,11 +2384,15 @@ async def run_one_cell(
                     )
                     if engine not in (ENGINE_SGLANG, ENGINE_VLLM):
                         full_concurrency_running = all_streams_active
-                    server_ready = (
-                        state.srv_queue_reqs == 0
-                        and generating
-                        and (full_concurrency_running or short_request_flow)
-                    )
+                    if not state.metrics_available:
+                        full_concurrency_running = all_streams_active
+                        server_ready = generating and full_concurrency_running
+                    else:
+                        server_ready = (
+                            state.srv_queue_reqs == 0
+                            and generating
+                            and (full_concurrency_running or short_request_flow)
+                        )
                     if server_ready:
                         if warmup_stable_since is None:
                             warmup_stable_since = now
@@ -2373,11 +2400,17 @@ async def run_one_cell(
                             warmup_done = True
                             state.cell_warmup = False
                             warmup_duration = now - state.cell_start
-                            ready_reason = (
-                                f"running_reqs={state.srv_running_reqs}/{concurrency}, "
-                                f"queue_reqs={state.srv_queue_reqs}, "
-                                f"stable={ready_stable_seconds:.1f}s"
-                            )
+                            if state.metrics_available:
+                                ready_reason = (
+                                    f"running_reqs={state.srv_running_reqs}/{concurrency}, "
+                                    f"queue_reqs={state.srv_queue_reqs}, "
+                                    f"stable={ready_stable_seconds:.1f}s"
+                                )
+                            else:
+                                ready_reason = (
+                                    f"metrics_unavailable, active_streams={shared_active_streams[0]}/{concurrency}, "
+                                    f"stable={ready_stable_seconds:.1f}s"
+                                )
                             measurement_start = now
                             measurement_end = None
                             state.cell_measurement_start = now
@@ -2401,7 +2434,9 @@ async def run_one_cell(
                         state.cell_warmup = False
                         warmup_duration = now - state.cell_start
                         ready_reason = "warmup_timeout"
-                        if state.srv_running_reqs < concurrency:
+                        if not state.metrics_available:
+                            timeout_reason = "metrics_unavailable"
+                        elif state.srv_running_reqs < concurrency:
                             timeout_reason = f"running_reqs={state.srv_running_reqs}/{concurrency}"
                         elif state.srv_queue_reqs > 0:
                             timeout_reason = f"queue_reqs={state.srv_queue_reqs}"
@@ -2429,8 +2464,9 @@ async def run_one_cell(
                 update_state_request_stats(state, shared_request_samples)
                 if state.srv_gen_throughput > 0:
                     gen_throughput_samples.append(state.srv_gen_throughput)
-                running_reqs_samples.append(state.srv_running_reqs)
-                queue_reqs_samples.append(state.srv_queue_reqs)
+                if state.metrics_available:
+                    running_reqs_samples.append(state.srv_running_reqs)
+                    queue_reqs_samples.append(state.srv_queue_reqs)
             last_metrics_time = now
 
         # Sustained Decode live display prefers OpenAI stream usage. Prometheus
@@ -2457,7 +2493,7 @@ async def run_one_cell(
         measure_elapsed = (now - measurement_start) if measurement_start else 0
         if measurement_start and measure_elapsed >= duration:
             if engine == ENGINE_VLLM and measurement_gen_tokens_start is not None:
-                end_metrics = await scrape_metrics(client, base_url)
+                end_metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
                 measurement_gen_tokens_end = extract_metric(
                     end_metrics, metric_name(engine, "gen_tokens_total")
                 )
@@ -2502,7 +2538,7 @@ async def run_one_cell(
     update_state_request_stats(state, request_samples)
 
     # Final metrics scrape
-    metrics = await scrape_metrics(client, base_url)
+    metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
     if engine == ENGINE_SGLANG:
         final_gen_throughput = extract_metric(metrics, metric_name(engine, "gen_throughput"))
     else:
@@ -2690,6 +2726,16 @@ def build_display(state: TUIState) -> Layout:
     mode, term_width, term_height = live_layout_mode()
     narrow = mode == "narrow"
     mid = mode == "mid"
+    current_ratio, server_ratio, hardware_ratio = (5, 3, 7)
+    if mid:
+        # Mid-width terminals still have enough horizontal space for a real
+        # GPU table if the hardware pane is given priority. The current/server
+        # panes tolerate tighter widths better than 8 GPU telemetry rows do.
+        current_ratio, server_ratio, hardware_ratio = (4, 2, 8)
+    hardware_est_width = max(
+        0,
+        int(term_width * hardware_ratio / max(1, current_ratio + server_ratio + hardware_ratio)),
+    )
     show_narrow_hw = narrow and term_height >= 30
     narrow_hw_size = 0
     narrow_top_size = 0
@@ -2721,9 +2767,9 @@ def build_display(state: TUIState) -> Layout:
             )
     else:
         layout["middle"].split_row(
-            Layout(name="current_test", ratio=5),
-            Layout(name="server_metrics", ratio=3),
-            Layout(name="hardware_metrics", ratio=7),
+            Layout(name="current_test", ratio=current_ratio),
+            Layout(name="server_metrics", ratio=server_ratio),
+            Layout(name="hardware_metrics", ratio=hardware_ratio),
         )
 
     # Header
@@ -2750,6 +2796,8 @@ def build_display(state: TUIState) -> Layout:
             header_text.append(f"MaxReqs: {state.max_running_requests}", style=PHOSPHOR)
         if state.skipped_cells > 0:
             header_text.append(f"  ({state.skipped_cells} skipped)", style=PHOSPHOR_WARN)
+    if not state.metrics_available:
+        header_text.append("  | metrics disabled", style=PHOSPHOR_WARN)
     layout["header"].update(
         Panel(
             header_text,
@@ -2781,6 +2829,9 @@ def build_display(state: TUIState) -> Layout:
                 # During ramp-up: show elapsed warmup time and why we're waiting
                 if state.srv_gen_throughput == 0 and state.cell_tokens == 0:
                     wait_reason = "waiting for token generation (JIT compile?)"
+                elif not state.metrics_available:
+                    active = getattr(state, "_active_streams", 0)
+                    wait_reason = f"metrics disabled; waiting for streams ({active}/{state.current_concurrency})"
                 elif state.srv_queue_reqs > 0:
                     wait_reason = "waiting for queue→0 (prefill ramp-up)"
                 elif state.srv_running_reqs < state.current_concurrency:
@@ -2861,11 +2912,16 @@ def build_display(state: TUIState) -> Layout:
     srv_table = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     srv_table.add_column("Metric", style="dim")
     srv_table.add_column("Value", style=f"bold {TEXT_PRIMARY}", justify="right")
-    srv_table.add_row("gen_throughput", f"[{PHOSPHOR}]{state.srv_gen_throughput:.1f} tok/s[/{PHOSPHOR}]")
-    srv_table.add_row("running_reqs", str(state.srv_running_reqs))
-    srv_table.add_row("queue_reqs", str(state.srv_queue_reqs))
-    srv_table.add_row("utilization", f"[{PHOSPHOR_DIM}]{state.srv_utilization:.2%}[/{PHOSPHOR_DIM}]")
-    if state.srv_spec_accept_rate > 0 or state.srv_spec_accept_length > 0:
+    if not state.metrics_available:
+        srv_table.add_row("metrics", f"[{PHOSPHOR_WARN}]disabled[/]")
+        srv_table.add_row("source", "OpenAI stream")
+        srv_table.add_row("scheduler", "[dim]unavailable[/dim]")
+    else:
+        srv_table.add_row("gen_throughput", f"[{PHOSPHOR}]{state.srv_gen_throughput:.1f} tok/s[/{PHOSPHOR}]")
+        srv_table.add_row("running_reqs", str(state.srv_running_reqs))
+        srv_table.add_row("queue_reqs", str(state.srv_queue_reqs))
+        srv_table.add_row("utilization", f"[{PHOSPHOR_DIM}]{state.srv_utilization:.2%}[/{PHOSPHOR_DIM}]")
+    if state.metrics_available and (state.srv_spec_accept_rate > 0 or state.srv_spec_accept_length > 0):
         srv_table.add_row("spec_accept_rate", f"[{PHOSPHOR_SOFT}]{state.srv_spec_accept_rate:.2%}[/{PHOSPHOR_SOFT}]")
         srv_table.add_row("spec_accept_len", f"[{PHOSPHOR_SOFT}]{state.srv_spec_accept_length:.1f}[/{PHOSPHOR_SOFT}]")
     layout["server_metrics"].update(
@@ -2879,10 +2935,13 @@ def build_display(state: TUIState) -> Layout:
         )
     )
 
-    if not narrow and not mid:
-        layout["hardware_metrics"].update(render_hardware_panel(state))
-    elif mid:
-        layout["hardware_metrics"].update(render_compact_hardware_panel(state, paired=False))
+    if not narrow:
+        if mode == "wide" or hardware_est_width >= 64:
+            layout["hardware_metrics"].update(
+                render_hardware_panel(state, dense=(mode == "mid" and hardware_est_width < 92))
+            )
+        else:
+            layout["hardware_metrics"].update(render_compact_hardware_panel(state, paired=False))
     elif show_narrow_hw:
         layout["hardware_metrics"].update(render_compact_hardware_panel(state))
 
@@ -3240,6 +3299,8 @@ async def run_benchmark(args):
     server_context_length = 0
     max_running = None
     engine = ENGINE_SGLANG
+    metrics_available = True
+    metrics_warning = ""
     async with httpx.AsyncClient(headers=auth_headers) as check_client:
         try:
             resp = await check_client.get(f"{base_url}/v1/models", timeout=10.0)
@@ -3273,24 +3334,33 @@ async def run_benchmark(args):
                 if max_running:
                     max_running = int(max_running)
                 server_context_length = server_info.get("context_length") or server_context_length
-                # Verify that --enable-metrics is active
+                # SGLang metrics are useful for scheduler/effective-concurrency
+                # validation, but they are no longer required for the portable
+                # OpenAI-stream headline metrics.
                 try:
                     metrics_resp = await check_client.get(f"{base_url}/metrics", timeout=5.0)
                     if "sglang:" not in metrics_resp.text[:2000]:
-                        console.print(
-                            "[bold red]ERROR: SGLang server does not have metrics enabled.[/bold red]\n"
-                            "This benchmark requires Prometheus metrics for accurate server-side throughput measurement.\n"
-                            "Restart SGLang with [bold]--enable-metrics[/bold] flag.\n\n"
-                            "Example:\n"
-                            "  python -m sglang.launch_server --model ... --enable-metrics"
+                        metrics_available = False
+                        metrics_warning = (
+                            "SGLang /metrics is reachable but does not expose sglang:* metrics; "
+                            "scheduler/effective-concurrency and Prometheus validation are disabled. "
+                            "Restart with --enable-metrics for those diagnostics."
                         )
-                        sys.exit(1)
-                except httpx.HTTPError:
-                    console.print(
-                        "[bold red]ERROR: Cannot reach SGLang /metrics endpoint.[/bold red]\n"
-                        "Restart SGLang with [bold]--enable-metrics[/bold] flag."
+                        console.print(
+                            "[bold yellow]WARNING: SGLang metrics are disabled.[/bold yellow]\n"
+                            f"{metrics_warning}"
+                        )
+                except httpx.HTTPError as exc:
+                    metrics_available = False
+                    metrics_warning = (
+                        f"Cannot reach SGLang /metrics endpoint ({type(exc).__name__}); "
+                        "scheduler/effective-concurrency and Prometheus validation are disabled. "
+                        "Restart with --enable-metrics for those diagnostics."
                     )
-                    sys.exit(1)
+                    console.print(
+                        "[bold yellow]WARNING: SGLang metrics are disabled.[/bold yellow]\n"
+                        f"{metrics_warning}"
+                    )
             else:
                 raise ValueError("Not SGLang")
         except Exception:
@@ -3314,13 +3384,38 @@ async def run_benchmark(args):
                         engine = ENGINE_SGLANG
                         console.print(f"[green]Engine: SGLang (assumed)[/green]  Models: {model_ids}")
                 except Exception:
+                    engine = ENGINE_SGLANG
+                    metrics_available = False
+                    metrics_warning = (
+                        "Could not detect engine metrics; scheduler/effective-concurrency "
+                        "and Prometheus validation are disabled."
+                    )
                     console.print(f"[yellow]Could not detect engine. Assuming SGLang.[/yellow]  Models: {model_ids}")
+                    console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
+
+        if engine == ENGINE_VLLM and metrics_available:
+            try:
+                metrics_resp = await check_client.get(f"{base_url}/metrics", timeout=5.0)
+                if "vllm:" not in metrics_resp.text:
+                    metrics_available = False
+                    metrics_warning = (
+                        "vLLM /metrics is reachable but does not expose vllm:* metrics; "
+                        "scheduler/effective-concurrency, KV auto-detection, and Prometheus validation are disabled."
+                    )
+                    console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
+            except httpx.HTTPError as exc:
+                metrics_available = False
+                metrics_warning = (
+                    f"Cannot reach vLLM /metrics endpoint ({type(exc).__name__}); "
+                    "scheduler/effective-concurrency, KV auto-detection, and Prometheus validation are disabled."
+                )
+                console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
 
         # vLLM exposes cache_config_info with local num_gpu_blocks and block_size
         # in current builds. With DCP, vLLM multiplies this local budget by the
         # CP/DCP world size in the startup log. Current vLLM builds do not expose
         # the multiplier in Prometheus, so --dcp-size supplies it for remote runs.
-        if engine == ENGINE_VLLM and args.max_total_tokens == 0:
+        if engine == ENGINE_VLLM and metrics_available and args.max_total_tokens == 0:
             metrics = await scrape_metrics(check_client, base_url)
             block_size = extract_label(metrics, "vllm:cache_config_info", "block_size")
             num_gpu_blocks = extract_label(metrics, "vllm:cache_config_info", "num_gpu_blocks")
@@ -3604,7 +3699,13 @@ async def run_benchmark(args):
         context_lengths=context_lengths,
         overall_start=time.monotonic(),
         show_capacity_limited_values=args.show_capacity_limited_values,
+        metrics_available=metrics_available,
+        metrics_warning=metrics_warning,
     )
+    args.metrics_available = metrics_available
+    args.metrics_warning = metrics_warning
+    if metrics_warning:
+        add_event(state, metrics_warning)
     if max_running:
         state.max_running_requests = int(max_running)
     state.max_tokens = args.max_tokens
@@ -3768,7 +3869,7 @@ async def run_benchmark(args):
             "server_invalid_reason": "",
         }
         label_filter = 'stage="prefill_forward"' if engine == ENGINE_SGLANG else ""
-        collect_server_validation = args.prefill_metric in ("auto", "prometheus")
+        collect_server_validation = state.metrics_available and args.prefill_metric in ("auto", "prometheus")
         if collect_server_validation:
             probe_metrics = await scrape_metrics(client, base_url)
             collect_server_validation = (
@@ -3791,13 +3892,14 @@ async def run_benchmark(args):
         live.update(build_display(state))
         request_task = asyncio.create_task(measure_ttft(client, messages))
         while not request_task.done():
-            metrics = await scrape_metrics(client, base_url)
-            state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
-            state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
-            state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
-            state.srv_gen_throughput = extract_metric(metrics, metric_name(engine, "gen_throughput"))
-            state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
-            state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
+            if state.metrics_available:
+                metrics = await scrape_metrics(client, base_url)
+                state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
+                state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
+                state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
+                state.srv_gen_throughput = extract_metric(metrics, metric_name(engine, "gen_throughput"))
+                state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
+                state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
             live.update(build_display(state))
             await asyncio.sleep(0.5)
         ttft, usage_prompt_tokens = await request_task
@@ -4845,6 +4947,8 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
             "ignore_eos": not getattr(args, "respect_eos", False),
             "max_total_tokens": args.max_total_tokens,
             "dcp_size": getattr(args, "dcp_size", 1),
+            "metrics_available": getattr(args, "metrics_available", True),
+            "metrics_warning": getattr(args, "metrics_warning", ""),
             "concurrency_levels": concurrency_levels,
             "context_lengths": context_lengths,
             "startup_diagnostics_available": bool(getattr(args, "startup_diagnostics", {})),

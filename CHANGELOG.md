@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.1 - 2026-04-26
+
+### Metrics optionality
+
+- SGLang without `--enable-metrics` is no longer fatal.
+- Missing `/metrics` now produces a visible warning and the benchmark continues using OpenAI stream metrics for headline throughput.
+- Scheduler/effective-concurrency, KV auto-detection from Prometheus, and Prometheus validation are marked unavailable when metrics are disabled.
+- Duration warmup falls back to client stream activity when scheduler metrics are unavailable, avoiding the old 60 second wait for `running_reqs`.
+- Request-count Burst / E2E mode also skips repeated `/metrics` scrapes when metrics are unavailable.
+
+### Live dashboard
+
+- Improved the mid-width hardware panel: it now gets more horizontal space and uses a real GPU table before falling back to the ultra-compact layout.
+
 ## 0.4.0 - 2026-04-26
 
 ### Measurement methodology
