@@ -52,7 +52,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -479,6 +479,12 @@ def add_event(state: TUIState, message: str) -> None:
     state.events.append(f"{ts} {message}")
     if len(state.events) > 80:
         state.events = state.events[-80:]
+
+
+def snapshot_partial_prefill(state: TUIState) -> None:
+    """Keep Ctrl-C/q final reports in sync with already measured prefill rows."""
+    global _prefill_results
+    _prefill_results = dict(state.prefill_results)
 
 
 def hardware_snapshot(
@@ -1904,6 +1910,7 @@ async def run_one_cell(
                 "server_method": "",
                 "server_invalid_reason": "",
             }
+            snapshot_partial_prefill(state)
             state.prefill_samples_done = 1
             state.prefill_last_tps = tok_per_sec
             state.prefill_last_tokens = prompt_tokens
@@ -3753,7 +3760,7 @@ async def run_benchmark(args):
         state.total_tests += len(concurrency_levels) * len(context_lengths)
 
     # Run benchmark
-    global _partial_results
+    global _partial_results, _prefill_results
     all_results = []
     burst_results = []
     max_conc = max(concurrency_levels)
@@ -3838,6 +3845,7 @@ async def run_benchmark(args):
             "server_method": "",
             "server_invalid_reason": "",
         }
+        snapshot_partial_prefill(state)
         state.prefill_samples_done = 1
         state.prefill_last_tps = tok_per_sec
         state.prefill_last_tokens = prompt_tokens
@@ -4116,6 +4124,7 @@ async def run_benchmark(args):
                             "baseline": baseline_ttft, "samples": 0,
                             "prompt_tokens": 0, "skipped": True,
                         }
+                        snapshot_partial_prefill(state)
                     else:
                         sample_set = prefill_samples
                         method = sample_set[0].get("method", "client")
@@ -4149,6 +4158,7 @@ async def run_benchmark(args):
                             "server_method": "prometheus" if server_samples else "",
                             "server_invalid_reason": invalid_reasons[0] if invalid_reasons else "",
                         }
+                        snapshot_partial_prefill(state)
 
                     state.cell_running = False
                     if skipped or not prefill_samples:

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.2 - 2026-04-26
+
+### Graceful Quit
+
+- Fixed early `q` / Ctrl-C final reports losing already measured prefill rows.
+- Partial prefill results are now snapshotted whenever an integrated scout, scout-only prefill, or standalone prefill row completes.
+- Primary Summary now includes `Prefill tok/s` on interrupted runs as soon as any prefill row has been measured.
+
 ## 0.4.1 - 2026-04-26
 
 ### Metrics optionality
