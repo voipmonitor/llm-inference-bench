@@ -52,7 +52,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -5081,6 +5081,9 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
             border_style=FRAME_BORDER,
         ))
 
+    summary_prefill = None
+    summary_decode = None
+
     if prefill_results:
         summary_prefill = Table(
             title=render_title("Prefill tok/s"),
@@ -5106,7 +5109,6 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 f"{pr.get('tok_per_sec', 0):,.0f}",
                 str(pr.get("samples", "?")),
             )
-        console.print(summary_prefill)
 
     if results:
         summary_decode = Table(
@@ -5139,6 +5141,25 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 else:
                     row.append("-")
             summary_decode.add_row(*row)
+
+    if summary_prefill and summary_decode:
+        # Screenshot-friendly final block: keep the two headline matrices on
+        # one screen when the terminal is wide enough, otherwise preserve the
+        # readable stacked layout.
+        prefill_width = 44
+        decode_width = 14 + len(concurrency_levels) * 12
+        if console.width >= prefill_width + decode_width + 4:
+            side_by_side = Table.grid(expand=False)
+            side_by_side.add_column()
+            side_by_side.add_column()
+            side_by_side.add_row(summary_prefill, summary_decode)
+            console.print(side_by_side)
+        else:
+            console.print(summary_prefill)
+            console.print(summary_decode)
+    elif summary_prefill:
+        console.print(summary_prefill)
+    elif summary_decode:
         console.print(summary_decode)
 
 

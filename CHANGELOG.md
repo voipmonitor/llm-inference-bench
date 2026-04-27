@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.7 - 2026-04-27
+
+### Final report
+
+- The final Primary Summary now renders `Prefill tok/s` and `Aggregate decode tok/s` side-by-side on wide terminals, making the last screen easier to screenshot/share.
+- Narrow terminals keep the previous stacked layout to avoid wrapping/cropping the matrices.
+
 ## 0.4.6 - 2026-04-27
 
 ### Prefill stability
