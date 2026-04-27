@@ -52,7 +52,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -296,6 +296,7 @@ class TUIState:
     # Timing
     cell_times: list = field(default_factory=list)
     # Hardware monitor
+    hw_monitor_enabled: bool = True
     hw_available: bool = False
     hw_last_error: str = ""
     hw_last_update: float = 0.0
@@ -642,10 +643,14 @@ def collect_startup_diagnostics(args, base_url: str) -> dict:
 
 def start_hardware_monitor(state: TUIState, interval: float) -> None:
     if interval <= 0:
+        state.hw_monitor_enabled = False
+        state.hw_last_error = "hardware monitor disabled"
         return
     if shutil.which("nvidia-smi") is None:
+        state.hw_monitor_enabled = False
         state.hw_last_error = "nvidia-smi not found"
         return
+    state.hw_monitor_enabled = True
 
     def loop() -> None:
         while True:
@@ -2835,17 +2840,16 @@ def build_display(state: TUIState) -> Layout:
     mode, term_width, term_height = live_layout_mode()
     narrow = mode == "narrow"
     mid = mode == "mid"
+    show_hw_panel = state.hw_monitor_enabled
     current_ratio, server_ratio, hardware_ratio = (5, 3, 7)
     if mid:
         # Mid-width terminals still have enough horizontal space for a real
         # GPU table if the hardware pane is given priority. The current/server
         # panes tolerate tighter widths better than 8 GPU telemetry rows do.
         current_ratio, server_ratio, hardware_ratio = (4, 2, 8)
-    hardware_est_width = max(
-        0,
-        int(term_width * hardware_ratio / max(1, current_ratio + server_ratio + hardware_ratio)),
-    )
-    show_narrow_hw = narrow and term_height >= 30
+    ratio_sum = current_ratio + server_ratio + (hardware_ratio if show_hw_panel else 0)
+    hardware_est_width = max(0, int(term_width * hardware_ratio / max(1, ratio_sum))) if show_hw_panel else 0
+    show_narrow_hw = show_hw_panel and narrow and term_height >= 30
     narrow_hw_size = 0
     narrow_top_size = 0
     if show_narrow_hw:
@@ -2874,11 +2878,16 @@ def build_display(state: TUIState) -> Layout:
                 Layout(name="current_test", ratio=3),
                 Layout(name="server_metrics", ratio=2),
             )
-    else:
+    elif show_hw_panel:
         layout["middle"].split_row(
             Layout(name="current_test", ratio=current_ratio),
             Layout(name="server_metrics", ratio=server_ratio),
             Layout(name="hardware_metrics", ratio=hardware_ratio),
+        )
+    else:
+        layout["middle"].split_row(
+            Layout(name="current_test", ratio=current_ratio),
+            Layout(name="server_metrics", ratio=server_ratio),
         )
 
     # Header
@@ -3046,14 +3055,14 @@ def build_display(state: TUIState) -> Layout:
         )
     )
 
-    if not narrow:
+    if show_hw_panel and not narrow:
         if mode == "wide" or hardware_est_width >= 64:
             layout["hardware_metrics"].update(
                 render_hardware_panel(state, dense=(mode == "mid" and hardware_est_width < 92))
             )
         else:
             layout["hardware_metrics"].update(render_compact_hardware_panel(state, paired=False))
-    elif show_narrow_hw:
+    elif show_hw_panel and show_narrow_hw:
         layout["hardware_metrics"].update(render_compact_hardware_panel(state))
 
     # Results table
@@ -3398,13 +3407,20 @@ async def run_benchmark(args):
     server_label = base_url.replace("http://", "").replace("https://", "")
     auth_headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
     console = Console()
+    startup_events: list[str] = []
+
+    def remember_startup(message: str) -> None:
+        startup_events.append(message)
+
     startup_diagnostics = collect_startup_diagnostics(args, base_url)
     setattr(args, "startup_diagnostics", startup_diagnostics)
 
     # --kv-budget overrides --max-total-tokens
     if args.kv_budget > 0:
         args.max_total_tokens = args.kv_budget
+        msg = f"KV cache budget manual: {args.max_total_tokens:,} tokens"
         console.print(f"[cyan]KV cache budget (manual):[/cyan] {args.max_total_tokens:,} tokens")
+        remember_startup(msg)
 
     # --- Step 1: Connect to server, detect engine, and read limits ---
     server_context_length = 0
@@ -3436,11 +3452,13 @@ async def run_benchmark(args):
             if "max_total_num_tokens" in server_info:
                 engine = ENGINE_SGLANG
                 console.print(f"[green]Engine: SGLang {server_info.get('version', '?')}[/green]  Models: {model_ids}")
+                remember_startup(f"engine SGLang {server_info.get('version', '?')} models={model_ids}")
                 if args.max_total_tokens == 0:
                     kv_budget = server_info.get("max_total_num_tokens", 0)
                     if kv_budget:
                         args.max_total_tokens = int(kv_budget)
                         console.print(f"[cyan]KV cache budget:[/cyan] {args.max_total_tokens:,} tokens")
+                        remember_startup(f"KV cache budget: {args.max_total_tokens:,} tokens")
                 max_running = server_info.get("max_running_requests")
                 if max_running:
                     max_running = int(max_running)
@@ -3461,6 +3479,7 @@ async def run_benchmark(args):
                             "[bold yellow]WARNING: SGLang metrics are disabled.[/bold yellow]\n"
                             f"{metrics_warning}"
                         )
+                        remember_startup(f"WARNING: {metrics_warning}")
                 except httpx.HTTPError as exc:
                     metrics_available = False
                     metrics_warning = (
@@ -3472,6 +3491,7 @@ async def run_benchmark(args):
                         "[bold yellow]WARNING: SGLang metrics are disabled.[/bold yellow]\n"
                         f"{metrics_warning}"
                     )
+                    remember_startup(f"WARNING: {metrics_warning}")
             else:
                 raise ValueError("Not SGLang")
         except Exception:
@@ -3482,6 +3502,7 @@ async def run_benchmark(args):
                 if "version" in version_info:
                     engine = ENGINE_VLLM
                     console.print(f"[green]Engine: vLLM {version_info['version']}[/green]  Models: {model_ids}")
+                    remember_startup(f"engine vLLM {version_info['version']} models={model_ids}")
                 else:
                     raise ValueError("No version")
             except Exception:
@@ -3492,9 +3513,11 @@ async def run_benchmark(args):
                     if resp.status_code < 400 and "vllm:" in metrics_head:
                         engine = ENGINE_VLLM
                         console.print(f"[green]Engine: vLLM (detected from metrics)[/green]  Models: {model_ids}")
+                        remember_startup(f"engine vLLM from metrics models={model_ids}")
                     elif resp.status_code < 400 and "sglang:" in metrics_head:
                         engine = ENGINE_SGLANG
                         console.print(f"[green]Engine: SGLang (detected from metrics)[/green]  Models: {model_ids}")
+                        remember_startup(f"engine SGLang from metrics models={model_ids}")
                     else:
                         engine = ENGINE_OPENAI_PROXY
                         metrics_available = False
@@ -3506,6 +3529,8 @@ async def run_benchmark(args):
                         )
                         console.print(f"[yellow]Engine: OpenAI-compatible proxy[/yellow]  Models: {model_ids}")
                         console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
+                        remember_startup(f"engine OpenAI-compatible proxy models={model_ids}")
+                        remember_startup(f"WARNING: {metrics_warning}")
                 except Exception:
                     engine = ENGINE_OPENAI_PROXY
                     metrics_available = False
@@ -3516,6 +3541,8 @@ async def run_benchmark(args):
                     )
                     console.print(f"[yellow]Engine: OpenAI-compatible proxy[/yellow]  Models: {model_ids}")
                     console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
+                    remember_startup(f"engine OpenAI-compatible proxy models={model_ids}")
+                    remember_startup(f"WARNING: {metrics_warning}")
 
         if engine == ENGINE_VLLM and metrics_available:
             try:
@@ -3527,6 +3554,7 @@ async def run_benchmark(args):
                         "scheduler/effective-concurrency, KV auto-detection, and Prometheus validation are disabled."
                     )
                     console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
+                    remember_startup(f"WARNING: {metrics_warning}")
             except httpx.HTTPError as exc:
                 metrics_available = False
                 metrics_warning = (
@@ -3534,6 +3562,7 @@ async def run_benchmark(args):
                     "scheduler/effective-concurrency, KV auto-detection, and Prometheus validation are disabled."
                 )
                 console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
+                remember_startup(f"WARNING: {metrics_warning}")
 
         # vLLM exposes cache_config_info with local num_gpu_blocks and block_size
         # in current builds. With DCP, vLLM multiplies this local budget by the
@@ -3563,6 +3592,10 @@ async def run_benchmark(args):
                             "--kv-budget to enable exact KV capacity skips for remote "
                             "vLLM. Leaving KV budget unset instead of assuming DCP=1.[/yellow]"
                         )
+                        remember_startup(
+                            f"WARNING: vLLM Prometheus reports local KV only ({local_kv_tokens:,}); "
+                            "pass --dcp-size or --kv-budget for exact capacity skips"
+                        )
                         raise ValueError("vLLM DCP multiplier unknown")
                     else:
                         cp_size = 1
@@ -3578,12 +3611,20 @@ async def run_benchmark(args):
                         f"{args.max_total_tokens:,} tokens "
                         f"({num_gpu_blocks} blocks × {block_size}{suffix})"
                     )
+                    remember_startup(
+                        f"KV cache budget from vLLM metrics: {args.max_total_tokens:,} tokens "
+                        f"({num_gpu_blocks} blocks x {block_size}{suffix})"
+                    )
                 else:
                     raise ValueError("cache_config_info missing block_size/num_gpu_blocks")
             except Exception:
                 console.print(
                     "[yellow]vLLM: KV cache budget not available from metrics. "
                     "Use --kv-budget to skip over-capacity cells, or rely on queue detection.[/yellow]"
+                )
+                remember_startup(
+                    "WARNING: vLLM KV cache budget not available from metrics; "
+                    "use --kv-budget for exact capacity skips"
                 )
 
         # Handle max_running_requests
@@ -3592,8 +3633,10 @@ async def run_benchmark(args):
             if over:
                 concurrency_levels = [c for c in concurrency_levels if c <= max_running]
                 console.print(f"[cyan]Max running requests:[/cyan] {max_running} (dropped C={','.join(str(c) for c in over)})")
+                remember_startup(f"max running requests: {max_running}; dropped C={','.join(str(c) for c in over)}")
         if server_context_length:
             console.print(f"[cyan]Model context length:[/cyan] {server_context_length:,} tokens")
+            remember_startup(f"model context length: {server_context_length:,} tokens")
 
     # --- Step 2: Build prefill context list ---
     # Default prefill is integrated into scout requests. Every non-zero decode
@@ -3613,11 +3656,15 @@ async def run_benchmark(args):
     if args.skip_prefill:
         prefill_contexts = []
         console.print("[cyan]Prefill tests:[/cyan] skipped")
+        remember_startup("prefill tests: skipped")
     elif args.standalone_prefill:
         prefill_contexts = standalone_prefill_contexts
         console.print(
             "[cyan]Prefill tests:[/cyan] standalone cold profile "
             f"{[format_context(c) for c in prefill_contexts]}"
+        )
+        remember_startup(
+            f"prefill tests: standalone cold profile {[format_context(c) for c in prefill_contexts]}"
         )
     else:
         prefill_contexts = sorted(set(decode_prefill_contexts + requested_standalone_prefill_contexts))
@@ -3628,6 +3675,10 @@ async def run_benchmark(args):
         )
         console.print(
             "[cyan]Prefill tests:[/cyan] integrated from decode scout requests "
+            f"{[format_context(c) for c in decode_prefill_contexts]}{extra}"
+        )
+        remember_startup(
+            "prefill tests: integrated from decode scout requests "
             f"{[format_context(c) for c in decode_prefill_contexts]}{extra}"
         )
 
@@ -3642,6 +3693,7 @@ async def run_benchmark(args):
     run_id = ''.join(random.choices(string.ascii_lowercase, k=12))
     if max_ctx > 0:
         console.print(f"[bold]Calibrating padding text (run={run_id}, up to {format_context(max_ctx)})...[/bold]")
+        remember_startup(f"calibrating padding text run={run_id} up_to={format_context(max_ctx)}")
         base_text = generate_padding_text(int(max_ctx * 3))
 
         def ensure_base_chars(min_chars: int) -> None:
@@ -3723,11 +3775,19 @@ async def run_benchmark(args):
                             f"  {format_context(ctx)}: {len(text):,} chars "
                             f"({actual:,} prompt tokens via /tokenize)"
                         )
+                        remember_startup(
+                            f"context {format_context(ctx)}: {len(text):,} chars "
+                            f"({actual:,} prompt tokens via /tokenize)"
+                        )
                     console.print("  Token targeting: /tokenize exact")
+                    remember_startup("token targeting: /tokenize exact")
                 except Exception as e:
                     console.print(
                         "[yellow]  /tokenize exact targeting failed; "
                         f"falling back to single-point estimate: {e}[/yellow]"
+                    )
+                    remember_startup(
+                        f"WARNING: /tokenize exact targeting failed; falling back to estimate: {e}"
                     )
                     context_cache.clear()
                     context_actual_tokens.clear()
@@ -3736,6 +3796,7 @@ async def run_benchmark(args):
                 f"  Token targeting: single-point estimate from {args.calibration_context} "
                 "(use --token-targeting exact for /tokenize binary search)"
             )
+            remember_startup(f"token targeting: estimate from {args.calibration_context}")
 
         if not context_cache:
             # Calibrate once, measure actual prompt_tokens, derive chars/token,
@@ -3752,6 +3813,10 @@ async def run_benchmark(args):
                     calibrated_cpt = float(cached["chars_per_token"])
                     console.print(
                         f"  Calibrated: {calibrated_cpt:.2f} chars/token "
+                        f"(cached, source={cached.get('source_context', 'unknown')})"
+                    )
+                    remember_startup(
+                        f"calibrated: {calibrated_cpt:.2f} chars/token "
                         f"(cached, source={cached.get('source_context', 'unknown')})"
                     )
                 else:
@@ -3790,6 +3855,10 @@ async def run_benchmark(args):
                     f"  Calibrated: {calibrated_cpt:.2f} chars/token "
                     f"(from {format_context(cal_ctx)} probe)"
                 )
+                remember_startup(
+                    f"calibrated: {calibrated_cpt:.2f} chars/token "
+                    f"(from {format_context(cal_ctx)} probe)"
+                )
                 if args.token_targeting == "estimate" and not args.no_calibration_cache:
                     cache[cache_key] = {
                         "chars_per_token": calibrated_cpt,
@@ -3810,8 +3879,10 @@ async def run_benchmark(args):
                 context_cache[ctx] = text
                 est_tokens = int(len(text) / calibrated_cpt)
                 console.print(f"  {format_context(ctx)}: {len(text):,} chars (~{est_tokens:,} tokens)")
+                remember_startup(f"context {format_context(ctx)}: {len(text):,} chars (~{est_tokens:,} tokens)")
     context_cache[0] = ""
     console.print("[green]Done.[/green]\n")
+    remember_startup("startup preparation done")
 
     # --- Step 4: Initialize TUI state ---
     state = TUIState(
@@ -3828,8 +3899,17 @@ async def run_benchmark(args):
     )
     args.metrics_available = metrics_available
     args.metrics_warning = metrics_warning
+    add_event(state, f"benchmark start engine={engine or 'unknown'}")
+    add_event(state, f"startup server={base_url} model={args.model}")
+    add_event(
+        state,
+        f"startup decode concurrency={','.join(str(c) for c in concurrency_levels)} "
+        f"contexts={','.join(format_context(c) for c in context_lengths)}",
+    )
+    for message in startup_events:
+        add_event(state, f"startup {message}")
     if metrics_warning:
-        add_event(state, metrics_warning)
+        add_event(state, f"startup WARNING: {metrics_warning}")
     if max_running:
         state.max_running_requests = int(max_running)
     state.max_tokens = args.max_tokens
@@ -3837,8 +3917,29 @@ async def run_benchmark(args):
     state.benchmark_mode = "request-count" if args.request_count > 0 else "duration"
     state.request_count_target = args.request_count
     state.hw_gpu_limit = args.hw_gpu_limit
-    add_event(state, f"benchmark start engine={engine or 'unknown'}")
-    if not args.no_hw_monitor and args.display_mode != "plain":
+    hw_monitor_requested = (
+        not args.no_hw_monitor
+        and args.display_mode != "plain"
+        and args.hw_monitor_interval > 0
+    )
+    if not hw_monitor_requested:
+        state.hw_monitor_enabled = False
+        state.hw_last_error = "hardware monitor disabled"
+        add_event(state, "startup hardware monitor disabled")
+    elif shutil.which("nvidia-smi") is None:
+        state.hw_monitor_enabled = False
+        state.hw_last_error = "nvidia-smi not found"
+        console.print(
+            "[bold yellow]WARNING:[/bold yellow] nvidia-smi not found; "
+            "hardware panel disabled. This usually means the benchmark is not "
+            "running on the GPU server/container."
+        )
+        add_event(
+            state,
+            "startup WARNING: nvidia-smi not found; hardware panel disabled "
+            "(benchmark may be running off the GPU server/container)",
+        )
+    else:
         start_hardware_monitor(state, args.hw_monitor_interval)
         add_event(state, f"hardware monitor interval={args.hw_monitor_interval:g}s")
 

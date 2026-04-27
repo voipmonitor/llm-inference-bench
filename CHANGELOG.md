@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.5 - 2026-04-27
+
+### Startup visibility
+
+- Startup diagnostics are now replayed into the live event log after the TUI starts, so engine detection, KV/cache info, prefill setup, token calibration, and related warnings remain visible.
+- If `nvidia-smi` is not available, the benchmark prints a startup warning, records it in the event log, and disables the hardware panel instead of showing an empty/stale HW widget.
+
 ## 0.4.4 - 2026-04-27
 
 ### Live prefill progress
