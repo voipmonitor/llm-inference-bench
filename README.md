@@ -20,7 +20,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Live TUI dashboard** — adaptive Rich layout with compact modes for narrower terminals
 - **Live hardware panel** — GPU temperature, SM/memory utilization, VRAM usage, watts, clocks, PCIe rx/tx, plus CPU utilization/frequency
 - **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
-- **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling
+- **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling and live ETA for long-prefill rows
 - **Effective concurrency detection** — shows `(X/Y)*` when the server cannot actually run all requested concurrent requests
 - **Dynamic warmup** — uses scheduler metrics when available, with an OpenAI stream fallback when `/metrics` is disabled
 - **JSON output** — structured results saved to `benchmark_results.json` for further analysis
@@ -249,7 +249,7 @@ Results are saved as JSON with metadata and per-cell throughput data:
 ```json
 {
   "metadata": {
-    "version": "0.4.2",
+    "version": "0.4.3",
     "engine": "vllm",
     "model": "Qwen3_5-397B-A17B-NVFP4",
     "timestamp": "2026-03-13T00:30:53",

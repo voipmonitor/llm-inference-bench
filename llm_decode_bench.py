@@ -52,7 +52,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -110,6 +110,7 @@ METRIC_RE = re.compile(r'^((?:sglang|vllm):\w+)(?:\{([^}]*)\})?\s+([\d.eE+-]+)')
 # Engine types
 ENGINE_SGLANG = "sglang"
 ENGINE_VLLM = "vllm"
+ENGINE_OPENAI_PROXY = "openai_proxy"
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +841,63 @@ def format_time(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
+def format_prefill_eta(state: TUIState, elapsed: float) -> str:
+    """Build a live ETA for long prefill phases from completed prefill samples."""
+    target_tokens = max(0, int(getattr(state, "current_context", 0) or 0))
+    if target_tokens <= 0:
+        return f"[dim]eta: waiting for prefill completion, elapsed {format_time(elapsed)}[/dim]"
+
+    candidates: list[tuple[int, int, int, float, str]] = []
+    for raw_ctx, result in getattr(state, "prefill_results", {}).items():
+        if not isinstance(result, dict) or result.get("skipped"):
+            continue
+        rate = float(result.get("tok_per_sec") or 0.0)
+        if rate <= 0:
+            continue
+        try:
+            ctx_label = int(raw_ctx)
+            observed_tokens = int(result.get("tokens") or ctx_label)
+        except (TypeError, ValueError):
+            continue
+        method = str(result.get("method") or "prefill")
+        candidates.append((abs(ctx_label - target_tokens), ctx_label, observed_tokens, rate, method))
+
+    source = ""
+    rate = 0.0
+    estimated_prompt_tokens = target_tokens
+    if state.prefill_last_tps > 0:
+        rate = float(state.prefill_last_tps)
+        if state.prefill_last_tokens > 0:
+            estimated_prompt_tokens = int(state.prefill_last_tokens)
+        source = f"last sample @ {rate:,.0f} tok/s"
+    elif candidates:
+        _, ctx_label, observed_tokens, rate, method = min(candidates, key=lambda item: item[0])
+        if ctx_label > 0 and observed_tokens > 0:
+            estimated_prompt_tokens = max(1, int(target_tokens * (observed_tokens / ctx_label)))
+        source = f"{format_context(ctx_label)} {method} @ {rate:,.0f} tok/s"
+
+    if rate <= 0:
+        return (
+            f"[dim]eta: waiting for first completed prefill sample; "
+            f"elapsed {format_time(elapsed)}[/dim]"
+        )
+
+    estimated_total = max(estimated_prompt_tokens / rate, 0.1)
+    progress = min(max(elapsed / estimated_total, 0.0), 0.99)
+    if elapsed > estimated_total * 1.15:
+        return (
+            f"[dim]eta: estimate {format_time(estimated_total)} exceeded; "
+            f"still waiting ({source})[/dim]"
+        )
+
+    remaining = max(0.0, estimated_total - elapsed)
+    bar = render_progress_bar(progress, width=18)
+    return (
+        f"[dim]eta:[/dim] {bar} {progress * 100:>3.0f}%  "
+        f"left~{format_time(remaining)}  [dim]({source})[/dim]"
+    )
+
+
 def format_ms_value(seconds: float) -> str:
     if not seconds or seconds <= 0:
         return "—"
@@ -1494,8 +1552,9 @@ def metric_name(engine: str, key: str) -> str:
             "prefill_time_count": "vllm:request_prefill_time_seconds_count",
             "prefill_time_sum": "vllm:request_prefill_time_seconds_sum",
         },
+        ENGINE_OPENAI_PROXY: {},
     }
-    return names.get(engine, names[ENGINE_SGLANG]).get(key, "")
+    return names.get(engine, {}).get(key, "")
 
 
 def prefill_counter_snapshot(metrics: dict, engine: str) -> dict:
@@ -2822,10 +2881,12 @@ def build_display(state: TUIState) -> Layout:
             if state.prefill_last_tps > 0:
                 last_sample = f"last sample: {state.prefill_last_tps:,.0f} tok/s ({state.prefill_method})"
             status = state.prefill_status or "warming up"
+            prefill_eta = format_prefill_eta(state, elapsed)
             cell_text = (
                 f"[bold {PHOSPHOR_SOFT}]PREFILL[/bold {PHOSPHOR_SOFT}]  [dim]ctx=[/dim][{TEXT_PRIMARY}]{format_context(state.current_context)}[/{TEXT_PRIMARY}]\n"
-                f"  Elapsed: {elapsed:.1f}s\n"
+                f"  Elapsed: {format_time(elapsed)}\n"
                 f"  status: {status}\n"
+                f"  {prefill_eta}\n"
                 f"  [dim]{last_sample}[/dim]  samples={state.prefill_samples_done}\n"
                 f"  [dim]server now:[/dim] running={state.srv_running_reqs} queue={state.srv_queue_reqs} "
                 f"kv={state.srv_utilization:.2%}\n"
@@ -3384,20 +3445,33 @@ async def run_benchmark(args):
                 # Fallback: check /metrics prefix
                 try:
                     resp = await check_client.get(f"{base_url}/metrics", timeout=5.0)
-                    if "vllm:" in resp.text[:2000]:
+                    metrics_head = resp.text[:2000]
+                    if resp.status_code < 400 and "vllm:" in metrics_head:
                         engine = ENGINE_VLLM
                         console.print(f"[green]Engine: vLLM (detected from metrics)[/green]  Models: {model_ids}")
-                    else:
+                    elif resp.status_code < 400 and "sglang:" in metrics_head:
                         engine = ENGINE_SGLANG
-                        console.print(f"[green]Engine: SGLang (assumed)[/green]  Models: {model_ids}")
+                        console.print(f"[green]Engine: SGLang (detected from metrics)[/green]  Models: {model_ids}")
+                    else:
+                        engine = ENGINE_OPENAI_PROXY
+                        metrics_available = False
+                        reason = f"HTTP {resp.status_code}" if resp.status_code >= 400 else "no vllm:/sglang: metrics"
+                        metrics_warning = (
+                            f"Only OpenAI /v1 endpoints appear reachable ({reason} on /metrics); "
+                            "engine-specific probes and Prometheus diagnostics are disabled. "
+                            "Using OpenAI-stream-only measurement."
+                        )
+                        console.print(f"[yellow]Engine: OpenAI-compatible proxy[/yellow]  Models: {model_ids}")
+                        console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
                 except Exception:
-                    engine = ENGINE_SGLANG
+                    engine = ENGINE_OPENAI_PROXY
                     metrics_available = False
                     metrics_warning = (
-                        "Could not detect engine metrics; scheduler/effective-concurrency "
-                        "and Prometheus validation are disabled."
+                        "Only OpenAI /v1 endpoints appear reachable; engine-specific probes, "
+                        "scheduler/effective-concurrency, and Prometheus validation are disabled. "
+                        "Using OpenAI-stream-only measurement."
                     )
-                    console.print(f"[yellow]Could not detect engine. Assuming SGLang.[/yellow]  Models: {model_ids}")
+                    console.print(f"[yellow]Engine: OpenAI-compatible proxy[/yellow]  Models: {model_ids}")
                     console.print(f"[bold yellow]WARNING:[/bold yellow] {metrics_warning}")
 
         if engine == ENGINE_VLLM and metrics_available:

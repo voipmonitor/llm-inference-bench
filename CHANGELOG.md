@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.3 - 2026-04-27
+
+### Reverse proxies
+
+- Fixed OpenAI-compatible reverse proxies that forward `/v1/*` but return 502 or non-Prometheus bodies for `/version`, `/get_server_info`, and `/metrics`.
+- Such endpoints are now detected as `openai_proxy`, Prometheus diagnostics are disabled, and sustained decode warmup uses client stream activity instead of waiting 60 seconds for nonexistent scheduler metrics.
+
+### Live prefill progress
+
+- Added live prefill ETA/progress text for long-prefill models.
+- The ETA uses the nearest completed prefill sample, including the observed tokenizer-token ratio, so long contexts show an approximate remaining time instead of only a static "prefill" status.
+- When no prefill baseline exists yet, the dashboard explicitly says it is waiting for the first completed prefill sample.
+
 ## 0.4.2 - 2026-04-26
 
 ### Graceful Quit
