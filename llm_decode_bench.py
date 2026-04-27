@@ -52,7 +52,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -1618,6 +1618,31 @@ async def wait_server_idle(
     return last_metrics
 
 
+async def wait_prefill_task_with_live(
+    request_task: asyncio.Task,
+    client: httpx.AsyncClient,
+    base_url: str,
+    engine: str,
+    state: TUIState,
+    live: object,
+    status: str,
+):
+    """Refresh the live dashboard while a long prefill request is in flight."""
+    while not request_task.done():
+        state.prefill_status = status
+        if state.metrics_available:
+            metrics = await scrape_metrics(client, base_url)
+            state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
+            state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
+            state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
+            state.srv_gen_throughput = extract_metric(metrics, metric_name(engine, "gen_throughput"))
+            state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
+            state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
+        live.update(build_display(state))
+        await asyncio.sleep(0.5)
+    return await request_task
+
+
 class NullLive:
     """Drop-in replacement for Rich Live when --display-mode=plain is used."""
 
@@ -1919,40 +1944,58 @@ async def run_one_cell(
             state.prefill_last_seconds = 0.0
             add_event(state, f"integrated prefill start ctx={format_context(context_tokens)}")
             live.update(build_display(state))
-        scout_t0 = time.monotonic()
-        scout_ttft = None
-        scout_prompt_tokens = None
-        scout_ok = False
-        try:
-            async with client.stream("POST", url, json=scout_payload,
-                                     timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
+        async def run_scout_request():
+            scout_t0 = time.monotonic()
+            scout_ttft = None
+            scout_prompt_tokens = None
+            scout_ok = False
+            try:
+                async with client.stream("POST", url, json=scout_payload,
+                                         timeout=httpx.Timeout(600.0, connect=30.0)) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            scout_ok = True
+                            break
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        usage = data.get("usage")
+                        if usage and "prompt_tokens" in usage:
+                            scout_prompt_tokens = usage["prompt_tokens"]
+                        if scout_ttft is None and "choices" in data and len(data["choices"]) > 0:
+                            delta = data["choices"][0].get("delta", {})
+                            if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content"):
+                                scout_ttft = time.monotonic() - scout_t0
+                    if scout_prompt_tokens is not None or scout_ttft is not None:
                         scout_ok = True
-                        break
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    usage = data.get("usage")
-                    if usage and "prompt_tokens" in usage:
-                        scout_prompt_tokens = usage["prompt_tokens"]
-                    if scout_ttft is None and "choices" in data and len(data["choices"]) > 0:
-                        delta = data["choices"][0].get("delta", {})
-                        if delta.get("content") or delta.get("reasoning") or delta.get("reasoning_content"):
-                            scout_ttft = time.monotonic() - scout_t0
-                if scout_prompt_tokens is not None or scout_ttft is not None:
-                    scout_ok = True
-        except Exception as e:
-            if should_record_prefill:
-                add_event(state, f"integrated prefill failed ctx={format_context(context_tokens)}: {type(e).__name__}")
+                return scout_ttft, scout_prompt_tokens, scout_ok, None
+            except Exception as exc:
+                return scout_ttft, scout_prompt_tokens, scout_ok, exc
+
+        scout_wall_start = time.monotonic()
+        scout_task = asyncio.create_task(run_scout_request())
+        scout_ttft, scout_prompt_tokens, scout_ok, scout_error = await wait_prefill_task_with_live(
+            scout_task,
+            client,
+            base_url,
+            engine,
+            state,
+            live,
+            "decode scout prefill: waiting for first token",
+        )
+        if should_record_prefill and scout_error is not None:
+            add_event(
+                state,
+                f"integrated prefill failed ctx={format_context(context_tokens)}: {type(scout_error).__name__}",
+        )
         if should_record_prefill and scout_ok:
             if scout_ttft is None:
-                scout_ttft = time.monotonic() - scout_t0
+                scout_ttft = time.monotonic() - scout_wall_start
             prompt_tokens = int(scout_prompt_tokens or context_tokens)
             tok_per_sec = (prompt_tokens / scout_ttft) if scout_ttft > 0 else 0.0
             state.prefill_results[context_tokens] = {
@@ -3902,7 +3945,16 @@ async def run_benchmark(args):
 
         text = context_cache.get(ctx, "") or generate_padding_text(ctx)
         msgs = build_messages(ctx, text)
-        ttft, usage_prompt_tokens = await measure_ttft(client, msgs)
+        request_task = asyncio.create_task(measure_ttft(client, msgs))
+        ttft, usage_prompt_tokens = await wait_prefill_task_with_live(
+            request_task,
+            client,
+            base_url,
+            engine,
+            state,
+            live,
+            "scout-only prefill: waiting for first token",
+        )
         prompt_tokens = int(usage_prompt_tokens or ctx)
         tok_per_sec = (prompt_tokens / ttft) if ttft > 0 else 0.0
         state.prefill_results[ctx] = {
@@ -3973,18 +4025,15 @@ async def run_benchmark(args):
         state.prefill_status = "request in-flight; waiting for first token"
         live.update(build_display(state))
         request_task = asyncio.create_task(measure_ttft(client, messages))
-        while not request_task.done():
-            if state.metrics_available:
-                metrics = await scrape_metrics(client, base_url)
-                state.srv_running_reqs = int(extract_metric(metrics, metric_name(engine, "running_reqs")))
-                state.srv_queue_reqs = int(extract_metric(metrics, metric_name(engine, "queue_reqs")))
-                state.srv_utilization = extract_metric(metrics, metric_name(engine, "utilization"))
-                state.srv_gen_throughput = extract_metric(metrics, metric_name(engine, "gen_throughput"))
-                state.srv_spec_accept_rate = extract_metric(metrics, metric_name(engine, "spec_accept_rate"))
-                state.srv_spec_accept_length = extract_metric(metrics, metric_name(engine, "spec_accept_length"))
-            live.update(build_display(state))
-            await asyncio.sleep(0.5)
-        ttft, usage_prompt_tokens = await request_task
+        ttft, usage_prompt_tokens = await wait_prefill_task_with_live(
+            request_task,
+            client,
+            base_url,
+            engine,
+            state,
+            live,
+            "request in-flight; waiting for first token",
+        )
 
         if collect_server_validation:
             after_metrics = await wait_server_idle(

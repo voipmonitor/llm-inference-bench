@@ -249,7 +249,7 @@ Results are saved as JSON with metadata and per-cell throughput data:
 ```json
 {
   "metadata": {
-    "version": "0.4.3",
+    "version": "0.4.4",
     "engine": "vllm",
     "model": "Qwen3_5-397B-A17B-NVFP4",
     "timestamp": "2026-03-13T00:30:53",

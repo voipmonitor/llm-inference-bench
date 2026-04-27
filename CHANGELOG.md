@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.4 - 2026-04-27
+
+### Live prefill progress
+
+- Fixed integrated decode-scout prefill freezing the dashboard while waiting for the first token on long-context prompts.
+- The TUI now refreshes during integrated prefill, scout-only prefill, and standalone cold-prefill requests, so hardware stats, elapsed time, and ETA keep moving while prefill is in flight.
+
 ## 0.4.3 - 2026-04-27
 
 ### Reverse proxies
