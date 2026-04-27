@@ -18,7 +18,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Inline client latency detail** — aggregate decode cells can show `tok/s + TTFT/ITL` when there is enough terminal width
 - **Server-side validation** — optionally scrapes Prometheus `/metrics` for vLLM/SGLang validation, queue, KV, and scheduler signals
 - **Live TUI dashboard** — adaptive Rich layout with compact modes for narrower terminals
-- **Live hardware panel** — GPU temperature, SM/memory utilization, VRAM usage, watts, clocks, PCIe rx/tx, plus CPU utilization/frequency
+- **Live hardware panel** — GPU temperature, SM/memory utilization, VRAM usage, watts, clocks, PCIe rx/tx, plus CPU utilization/frequency and CPU package temperatures when exposed by the host
 - **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
 - **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling and live ETA for long-prefill rows
 - **Effective concurrency detection** — shows `(X/Y)*` when the server cannot actually run all requested concurrent requests
@@ -249,7 +249,7 @@ Results are saved as JSON with metadata and per-cell throughput data:
 ```json
 {
   "metadata": {
-    "version": "0.4.7",
+    "version": "0.4.8",
     "engine": "vllm",
     "model": "Qwen3_5-397B-A17B-NVFP4",
     "timestamp": "2026-03-13T00:30:53",

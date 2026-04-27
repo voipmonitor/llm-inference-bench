@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.8 - 2026-04-27
+
+### Hardware monitor
+
+- Added optional CPU temperature monitoring to the live hardware panel.
+- Supports multi-socket/package style labels when exposed by `psutil.sensors_temperatures()` or `/sys/class/hwmon`.
+- Hardware summary now includes max CPU temperature when available.
+
 ## 0.4.7 - 2026-04-27
 
 ### Final report

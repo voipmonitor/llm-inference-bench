@@ -52,7 +52,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.7"
+VERSION = "0.4.8"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -233,6 +233,12 @@ class GpuStats:
 
 
 @dataclass
+class CpuTemp:
+    label: str = ""
+    temp_c: float = 0.0
+
+
+@dataclass
 class TUIState:
     # Overall
     engine: str = ENGINE_SGLANG
@@ -302,6 +308,7 @@ class TUIState:
     hw_last_update: float = 0.0
     cpu_util_pct: float = 0.0
     cpu_freq_mhz: float = 0.0
+    cpu_temps: list[CpuTemp] = field(default_factory=list)
     hw_gpu_limit: int = 8
     gpu_stats: list[GpuStats] = field(default_factory=list)
     hw_history: list = field(default_factory=list)
@@ -476,6 +483,95 @@ def _sample_cpu_stats() -> tuple[float, float]:
         return 0.0, 0.0
 
 
+def _normalize_cpu_temp_label(raw: str, fallback_idx: int) -> str:
+    raw_l = raw.lower()
+    socket_match = re.search(r"(?:physical id|socket|package id)\s*([0-9]+)", raw_l)
+    if socket_match:
+        return f"CPU{socket_match.group(1)}"
+    package_match = re.search(r"package(?:\\s+id)?\\s*([0-9]+)", raw_l)
+    if package_match:
+        return f"CPU{package_match.group(1)}"
+    tctl_match = re.search(r"tctl(?:/tdie)?\\s*([0-9]+)?", raw_l)
+    if tctl_match and tctl_match.group(1):
+        return f"CPU{tctl_match.group(1)}"
+    if "package" in raw_l or "tctl" in raw_l or "tdie" in raw_l:
+        return f"CPU{fallback_idx}"
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "", raw).upper()
+    return cleaned[:8] or f"CPU{fallback_idx}"
+
+
+def _dedupe_cpu_temps(samples: list[CpuTemp]) -> list[CpuTemp]:
+    by_label: dict[str, CpuTemp] = {}
+    for sample in samples:
+        if sample.temp_c <= 0:
+            continue
+        existing = by_label.get(sample.label)
+        if existing is None or sample.temp_c > existing.temp_c:
+            by_label[sample.label] = sample
+    return [by_label[k] for k in sorted(by_label)]
+
+
+def _sample_cpu_temperatures() -> list[CpuTemp]:
+    samples: list[CpuTemp] = []
+    try:
+        import psutil  # optional runtime dependency; benchmark works without it.
+
+        temps = psutil.sensors_temperatures(fahrenheit=False) or {}
+        fallback_idx = 0
+        for entries in temps.values():
+            for entry in entries:
+                label = entry.label or getattr(entry, "sensor", "") or ""
+                label_l = label.lower()
+                if not any(x in label_l for x in ("package", "tctl", "tdie", "cpu")):
+                    continue
+                samples.append(CpuTemp(_normalize_cpu_temp_label(label, fallback_idx), float(entry.current or 0.0)))
+                fallback_idx += 1
+    except Exception:
+        pass
+    if samples:
+        return _dedupe_cpu_temps(samples)[:8]
+
+    # Fallback for minimal containers where psutil cannot see sensors but hwmon
+    # is mounted from the host. Prefer package/socket-like labels.
+    try:
+        hwmon_root = "/sys/class/hwmon"
+        if not os.path.isdir(hwmon_root):
+            return []
+        fallback_idx = 0
+        for hwmon in sorted(os.listdir(hwmon_root)):
+            path = os.path.join(hwmon_root, hwmon)
+            name_path = os.path.join(path, "name")
+            try:
+                chip_name = open(name_path).read().strip()
+            except Exception:
+                chip_name = hwmon
+            chip_l = chip_name.lower()
+            if not any(x in chip_l for x in ("k10temp", "coretemp", "cpu", "zenpower")):
+                continue
+            for fn in sorted(os.listdir(path)):
+                if not re.match(r"temp[0-9]+_input$", fn):
+                    continue
+                base = fn[:-6]
+                label = ""
+                try:
+                    label = open(os.path.join(path, f"{base}_label")).read().strip()
+                except Exception:
+                    pass
+                label_l = label.lower()
+                if label and not any(x in label_l for x in ("package", "tctl", "tdie", "cpu")):
+                    continue
+                try:
+                    milli_c = float(open(os.path.join(path, fn)).read().strip())
+                except Exception:
+                    continue
+                raw_label = label or chip_name
+                samples.append(CpuTemp(_normalize_cpu_temp_label(raw_label, fallback_idx), milli_c / 1000.0))
+                fallback_idx += 1
+    except Exception:
+        return []
+    return _dedupe_cpu_temps(samples)[:8]
+
+
 def add_event(state: TUIState, message: str) -> None:
     ts = time.strftime("%H:%M:%S")
     state.events.append(f"{ts} {message}")
@@ -493,14 +589,20 @@ def hardware_snapshot(
     gpus: list[GpuStats],
     cpu_util: float,
     cpu_freq: float,
+    cpu_temps: list[CpuTemp] | None = None,
     timestamp: float | None = None,
 ) -> dict:
+    cpu_temps = cpu_temps or []
+    cpu_temp_values = [t.temp_c for t in cpu_temps if t.temp_c > 0]
+    cpu_temp_map = {t.label: round(t.temp_c, 1) for t in cpu_temps if t.temp_c > 0}
     if not gpus:
         return {
             "timestamp": timestamp or time.monotonic(),
             "gpu_count": 0,
             "cpu_util_pct": round(cpu_util, 2),
             "cpu_freq_mhz": round(cpu_freq, 1),
+            "cpu_temp_max_c": round(max(cpu_temp_values), 2) if cpu_temp_values else 0.0,
+            "cpu_temps_c": cpu_temp_map,
         }
     gpu_utils = [g.gpu_util_pct for g in gpus]
     mem_utils = [g.mem_util_pct for g in gpus]
@@ -516,6 +618,8 @@ def hardware_snapshot(
         "gpu_count": len(gpus),
         "cpu_util_pct": round(cpu_util, 2),
         "cpu_freq_mhz": round(cpu_freq, 1),
+        "cpu_temp_max_c": round(max(cpu_temp_values), 2) if cpu_temp_values else 0.0,
+        "cpu_temps_c": cpu_temp_map,
         "gpu_util_avg_pct": round(mean(gpu_utils), 2),
         "gpu_util_max_pct": round(max(gpu_utils), 2),
         "mem_util_avg_pct": round(mean(mem_utils), 2),
@@ -556,6 +660,7 @@ def summarize_hardware_history(samples: list[dict]) -> dict:
         "duration_seconds": round(max(0.0, last_ts - first_ts), 3),
         "gpu_count": max(int(s.get("gpu_count", 0)) for s in samples),
         "cpu_util_avg_pct": avg("cpu_util_pct"),
+        "cpu_temp_max_c": maxv("cpu_temp_max_c"),
         "gpu_util_avg_pct": avg("gpu_util_avg_pct"),
         "gpu_util_max_pct": maxv("gpu_util_max_pct"),
         "mem_util_avg_pct": avg("mem_util_avg_pct"),
@@ -662,15 +767,17 @@ def start_hardware_monitor(state: TUIState, interval: float) -> None:
                     gpu.pcie_rx_mb_s = rx
                     gpu.pcie_tx_mb_s = tx
                 cpu_util, cpu_freq = _sample_cpu_stats()
+                cpu_temps = _sample_cpu_temperatures()
                 state.cpu_util_pct = cpu_util
                 state.cpu_freq_mhz = cpu_freq
+                state.cpu_temps = cpu_temps
                 state.gpu_stats = gpus
                 state.hw_available = bool(gpus)
                 state.hw_last_error = "" if gpus else "no GPU samples"
                 state.hw_last_update = time.monotonic()
                 if gpus:
                     state.hw_history.append(
-                        hardware_snapshot(gpus, cpu_util, cpu_freq, state.hw_last_update)
+                        hardware_snapshot(gpus, cpu_util, cpu_freq, cpu_temps, state.hw_last_update)
                     )
                     if len(state.hw_history) > 20000:
                         state.hw_history = state.hw_history[-10000:]
@@ -1018,6 +1125,22 @@ def format_gib_from_mb(mb: float) -> str:
     return f"{mb / 1024:.1f}G"
 
 
+def format_cpu_label(state: TUIState, compact: bool = False) -> str:
+    cpu = f"CPU {state.cpu_util_pct:.0f}%"
+    if state.cpu_freq_mhz > 0:
+        cpu += f" {format_ghz(state.cpu_freq_mhz)}"
+    if state.cpu_temps:
+        temps = " ".join(
+            f"{t.label}[{color_temp(t.temp_c)}]{t.temp_c:.0f}C[/]"
+            for t in state.cpu_temps[:(2 if compact else 4)]
+        )
+        hidden = len(state.cpu_temps) - (2 if compact else 4)
+        cpu += f"  {temps}"
+        if hidden > 0:
+            cpu += f" +{hidden}"
+    return cpu
+
+
 def render_hardware_panel(state: TUIState, dense: bool = False) -> Panel:
     if not state.hw_available:
         msg = "Waiting for hardware samples..."
@@ -1034,9 +1157,7 @@ def render_hardware_panel(state: TUIState, dense: bool = False) -> Panel:
 
     total_rx = sum(g.pcie_rx_mb_s for g in state.gpu_stats)
     total_tx = sum(g.pcie_tx_mb_s for g in state.gpu_stats)
-    cpu = f"CPU {state.cpu_util_pct:.0f}%"
-    if state.cpu_freq_mhz > 0:
-        cpu += f" {format_ghz(state.cpu_freq_mhz)}"
+    cpu = format_cpu_label(state, compact=dense)
     age = time.monotonic() - state.hw_last_update if state.hw_last_update else 0
 
     table = Table(show_header=True, box=None, padding=(0, 0 if dense else 1), expand=True)
@@ -1125,9 +1246,7 @@ def render_compact_hardware_panel(state: TUIState, paired: bool = True) -> Panel
         max_temp = max(g.temp_c for g in gpus)
         power_ratio = total_w / total_limit if total_limit > 0 else 0.0
         vram_ratio = total_used / total_mem if total_mem > 0 else 0.0
-        cpu = f"CPU {state.cpu_util_pct:.0f}%"
-        if state.cpu_freq_mhz > 0:
-            cpu += f" {format_ghz(state.cpu_freq_mhz)}"
+        cpu = format_cpu_label(state, compact=True)
         summary = (
             f"[dim]{cpu}[/dim]  "
             f"SM [{PHOSPHOR}]{avg_sm:.0f}%[/{PHOSPHOR}]  "
@@ -4970,6 +5089,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
         hw_table.add_column("Mem avg", justify="right", no_wrap=True)
         hw_table.add_column("W avg/max", justify="right", no_wrap=True)
         hw_table.add_column("T max", justify="right", no_wrap=True)
+        hw_table.add_column("CPU T", justify="right", no_wrap=True)
         hw_table.add_column("VRAM", justify="right", no_wrap=True)
         hw_table.add_column("PCIe rx/tx avg", justify="right", no_wrap=True)
         for r in hardware_rows:
@@ -4982,6 +5102,7 @@ def print_final_results(results: list, concurrency_levels: list, context_lengths
                 f"{hw.get('mem_util_avg_pct', 0):.0f}%",
                 f"{hw.get('power_total_avg_w', 0):.0f}/{hw.get('power_total_max_w', 0):.0f}",
                 f"{hw.get('temp_max_c', 0):.0f}C",
+                f"{hw.get('cpu_temp_max_c', 0):.0f}C" if hw.get("cpu_temp_max_c", 0) else "—",
                 f"{hw.get('vram_used_avg_pct', 0):.1f}%",
                 f"{hw.get('pcie_rx_avg_mb_s', 0):.0f}/{hw.get('pcie_tx_avg_mb_s', 0):.0f}",
             )
