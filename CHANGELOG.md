@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.6 - 2026-04-27
+
+### Prefill stability
+
+- Added an explicit default-mode prefill/JIT warmup before measured integrated scout prefill rows.
+- This makes the first reported 8k prefill row less dependent on whether the token-calibration probe ran cold or was loaded from the calibration cache.
+- The warmup uses a unique `[WARMUP_*]` prefix, so it warms kernels/graphs without intentionally reusing the measured `[BENCH_*]` prefix-cache entry.
+
 ## 0.4.5 - 2026-04-27
 
 ### Startup visibility

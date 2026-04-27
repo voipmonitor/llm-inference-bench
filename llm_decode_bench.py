@@ -52,7 +52,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -4424,6 +4424,49 @@ async def run_benchmark(args):
                 except Exception:
                     pass
                 state.cell_running = False
+                live.update(build_display(state))
+
+            if prefill_contexts and not args.skip_prefill and not args.standalone_prefill:
+                # Keep default prefill rows in a consistent warm state. Without
+                # this, the first reported 8k row can differ depending on
+                # whether token calibration had to run a hidden 8k probe or was
+                # loaded from the calibration cache.
+                warmup_ctx = min(min(prefill_contexts), parse_token_value("8k"))
+                add_event(state, f"prefill warmup start ctx={format_context(warmup_ctx)}")
+                state.prefill_phase = True
+                state.current_context = warmup_ctx
+                state.current_concurrency = 1
+                state.cell_running = True
+                state.cell_start = time.monotonic()
+                state.prefill_status = "warmup: prefill/JIT before measured rows"
+                state.prefill_samples_done = 0
+                state.prefill_last_tps = 0.0
+                state.prefill_last_tokens = 0
+                state.prefill_last_seconds = 0.0
+                state.prefill_method = "warmup"
+                live.update(build_display(state))
+
+                cached_warmup_text = context_cache.get(warmup_ctx) or generate_padding_text(warmup_ctx)
+                cached_prefix = f"[BENCH_{run_id}_CTX_{warmup_ctx}] "
+                warmup_prefix = f"[WARMUP_{run_id}_PREFILL] "
+                if cached_warmup_text.startswith(cached_prefix):
+                    warmup_text = warmup_prefix + cached_warmup_text[len(cached_prefix):]
+                else:
+                    warmup_text = warmup_prefix + cached_warmup_text
+                warmup_msgs = build_messages(warmup_ctx, warmup_text)
+                warmup_task = asyncio.create_task(measure_ttft(client, warmup_msgs))
+                await wait_prefill_task_with_live(
+                    warmup_task,
+                    client,
+                    base_url,
+                    engine,
+                    state,
+                    live,
+                    "warmup: prefill/JIT before measured rows",
+                )
+                state.cell_running = False
+                state.prefill_phase = False
+                add_event(state, f"prefill warmup done ctx={format_context(warmup_ctx)}")
                 live.update(build_display(state))
 
             if prefill_scout_only_contexts and not args.skip_prefill and not args.standalone_prefill:
