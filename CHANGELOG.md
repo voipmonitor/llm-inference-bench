@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.4.12 - 2026-05-06
+
+### Prefill-only profiling
+
+- Added `--prefill-only`, which implies `--standalone-prefill`, runs the cold-prefill profile, and exits before sustained decode or Burst / E2E.
+- Standalone prefill rows now capture hardware summaries, including PCIe RX/TX averages, and store them in JSON.
+- Final prefill tables now show PCIe RX/TX averages when hardware sampling is enabled.
+- Hardware sampling now remains enabled in `--display-mode plain`; use `--no-hw-monitor` to disable it explicitly.
+
+## 0.4.11 - 2026-05-04
+
+### Built-in task profiles
+
+- Added `--test-profile estonia`, a built-in GLM long-context completion-token profile with the prompt embedded directly in `llm_decode_bench.py` as a compressed `zlib+base64` blob.
+- Added fixed profile controls: `--profile-concurrency` / `--completion-stats-concurrency` and `--profile-runs` / `--completion-stats-runs`.
+- Selecting a test profile now implies completion-token statistics mode; if `--completion-stats` is used without `--prompt`, `--prompt-file`, or `--test-profile`, it defaults to `estonia`.
+- Improved the live completion-token display with profile name, progress bar, active request count, running completion-token percentiles, correctness rate, TTFT, and generation throughput while the test is still running.
+- Updated the completion-token final report to show profile metadata, requested runs, fixed/adaptive concurrency, prompt source, prompt size, and scoring configuration.
+
+## 0.4.10 - 2026-05-01
+
+### Completion-token statistics
+
+- Added `--completion-stats`, a separate adaptive task benchmark for long-answer token-efficiency tests such as the GLM-5.1 dense MLA vs NSA comparison.
+- The mode sends one optional prefix-cache scout request, probes increasing decode concurrency, selects the fastest aggregate generation-throughput level, and then collects at least `--completion-stats-min-results` completed answers at that selected concurrency.
+- Added final report tables for per-concurrency probe results and selected-concurrency completion-token statistics: avg/p50/p90/p99 completion tokens, elapsed time, TTFT, generation tok/s, max-token hits, and correctness rate.
+- Added `--prompt`, `--prompt-file`, `--completion-stats-concurrency-levels`, `--completion-stats-min-results`, `--completion-stats-correct-regex`, `--completion-stats-score-source`, `--completion-stats-save-text`, and related adaptive search controls.
+- Completion-stats mode defaults to the GLM `testLuke5.txt` prompt when available locally and uses `40000` max tokens unless `--max-tokens` is explicitly provided.
+
+## 0.4.9 - 2026-04-28
+
+### Internal sync
+
+- Synchronized the standalone `/mnt/llm_decode_bench.py` runtime version with the repository copy before adding the completion-token statistics mode.
+
 ## 0.4.8 - 2026-04-27
 
 ### Hardware monitor

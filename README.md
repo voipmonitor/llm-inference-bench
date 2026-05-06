@@ -21,6 +21,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Live hardware panel** — GPU temperature, SM/memory utilization, VRAM usage, watts, clocks, PCIe rx/tx, plus CPU utilization/frequency and CPU package temperatures when exposed by the host
 - **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
 - **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling and live ETA for long-prefill rows
+- **Completion-token statistics mode** — adaptive task benchmark for long-answer quality/token-efficiency tests such as GLM dense MLA vs NSA; warms prefill once, finds the fastest decode concurrency, then collects completion-token distributions
 - **Effective concurrency detection** — shows `(X/Y)*` when the server cannot actually run all requested concurrent requests
 - **Dynamic warmup** — uses scheduler metrics when available, with an OpenAI stream fallback when `/metrics` is disabled
 - **JSON output** — structured results saved to `benchmark_results.json` for further analysis
@@ -52,6 +53,11 @@ python3 llm_decode_bench.py --port 5001 --max-tokens 4096 --duration 60
 python3 llm_decode_bench.py --port 5001 \
     --standalone-prefill --prefill-contexts 8k,16k,32k,64k,128k
 
+# Prefill-only communication sweep: no sustained decode matrix
+python3 llm_decode_bench.py --port 5001 \
+    --prefill-only --prefill-contexts 8k,64k,128k \
+    --display-mode plain --hw-monitor-interval 0.5
+
 # Burst / E2E-only mode: exactly N measured requests per cell
 python3 llm_decode_bench.py --port 5001 --skip-prefill \
     --contexts 0 --concurrency 1,4 \
@@ -61,6 +67,19 @@ python3 llm_decode_bench.py --port 5001 --skip-prefill \
 python3 llm_decode_bench.py --port 5001 \
     --concurrency 1,4,8 --contexts 0,16k \
     --duration 30 --run-burst --burst-requests-per-concurrency 5
+
+# Built-in completion-token statistics profile for the GLM long-context task
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile estonia \
+    --profile-concurrency 8 \
+    --profile-runs 30 \
+    --max-tokens 40000
+
+# Adaptive completion-token statistics profile search
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile estonia \
+    --completion-stats-concurrency-levels 1,2,4,8,16,30 \
+    --completion-stats-min-results 30
 
 # Remote API with authentication (OpenRouter, Together AI, etc.)
 python3 llm_decode_bench.py --host https://openrouter.ai --api-key sk-or-... --model meta-llama/llama-3-70b
@@ -87,12 +106,21 @@ python3 llm_decode_bench.py --port 5199 --kv-budget 692736
 | `--prefill-contexts` | `8k,64k,128k` | Extra scout prefill contexts in default mode; standalone profile contexts with `--standalone-prefill` |
 | `--prefill-metric` | `client` | Prefill headline source: `client`, `auto`, or `prometheus`. `auto` adds Prometheus validation when available |
 | `--standalone-prefill` | `false` | Run the old repeated cold-prefill profile before decode |
+| `--prefill-only` | `false` | Run standalone cold-prefill profiling and exit before sustained decode; JSON and final table include hardware/PCIe summaries when hardware sampling is enabled |
 | `--request-count` | `0` | Burst / E2E-only mode: measured requests per cell. `0` keeps Sustained Decode as the primary mode |
 | `--warmup-request-count` | `0` | Warmup requests to discard before each `--request-count` cell |
 | `--run-burst` | `false` | After sustained decode, run an additional short Burst / E2E matrix |
 | `--burst-request-count` | `0` | Measured requests per Burst / E2E cell. `0` means `concurrency × --burst-requests-per-concurrency` |
 | `--burst-warmup-request-count` | `0` | Warmup requests per Burst / E2E cell. `0` means `concurrency` |
 | `--burst-requests-per-concurrency` | `5` | Auto Burst / E2E measured request multiplier |
+| `--test-profile` | | Built-in task profile. `estonia` embeds the GLM long-context prompt inside the script and implies `--completion-stats` |
+| `--profile-concurrency` | `0` | Fixed task-profile concurrency. `0` keeps adaptive probing |
+| `--profile-runs` | `0` | Fixed task-profile measured request count. `0` uses `--completion-stats-min-results` |
+| `--completion-stats` | `false` | Run adaptive completion-token statistics mode instead of the decode matrix |
+| `--completion-stats-min-results` | `30` | Minimum completed runs collected at the selected concurrency |
+| `--completion-stats-concurrency-levels` | `1,2,4,8,16,30` | Candidate concurrency levels for the adaptive probe |
+| `--completion-stats-correct-regex` | `\\bestonia\\b` | Regex used to score final-answer correctness; empty disables scoring |
+| `--completion-stats-save-text` | `false` | Store full streamed output/reasoning/content text in JSON instead of only final answer/excerpts |
 | `--hw-monitor-interval` | `2` | Live CPU/GPU hardware sampling interval in seconds |
 | `--hw-gpu-limit` | `8` | Maximum GPUs shown in the live hardware panel |
 | `--no-hw-monitor` | `false` | Disable live hardware sampling |
@@ -122,7 +150,10 @@ the old extra repeated prefill phase from normal runs while still showing ingest
 numbers for the exact prompts used by decode and the small 8k sanity point.
 
 Use `--standalone-prefill --prefill-contexts 8k,16k,32k,64k,128k` when you need
-the old repeated cold-prefill curve.
+the old repeated cold-prefill curve. Use `--prefill-only` for focused ingest
+and PCIe communication sweeps; it implies `--standalone-prefill`, exits before
+decode, and keeps hardware sampling active even with `--display-mode plain`
+unless `--no-hw-monitor` is set.
 
 Use this section to compare long-context ingest speed. Do not mix it with decode
 throughput; they stress different parts of the engine.
@@ -191,6 +222,61 @@ Sustained Decode and Burst / E2E Decode are present and labeled separately.
 If `--run-burst` is not set, the final report prints an explicit Phase 3 note:
 `Burst / E2E Decode: Not run`. This is the default to avoid doubling the runtime
 of a full matrix accidentally.
+
+### Completion-Token Statistics
+
+`--test-profile estonia` is the built-in long-answer task benchmark for the
+GLM-5.1 dense MLA vs NSA style test. The long prompt is embedded directly in
+`llm_decode_bench.py` as a compressed blob, so the benchmark can be run from a
+single script without copying `testLuke5.txt` around. The important questions are:
+
+- how many decode tokens the model needs before it reaches the final answer,
+- whether the final answer is correct,
+- which parallel decode concurrency gives the best aggregate throughput for
+  this task.
+
+The mode uses the OpenAI-compatible chat/completions stream and does not run the
+normal context/concurrency decode matrix. It sends one optional `max_tokens=1`
+scout request first to populate the server prefix cache. Measured requests then
+reuse the exact same prompt so engines with prefix caching can avoid repeated
+prefill and focus the benchmark on parallel decode.
+
+For explicit, reproducible profile runs, use fixed concurrency:
+
+```bash
+python3 llm_decode_bench.py --port 8001 --model GLM-5 \
+    --test-profile estonia \
+    --profile-concurrency 8 \
+    --profile-runs 30
+```
+
+This sends exactly 30 measured requests with up to 8 requests in flight. The
+live display shows active requests, completion progress, recent answers, running
+completion-token percentiles, correctness rate, TTFT, and generation throughput
+while the run is still in progress.
+
+If `--profile-concurrency` is not set, the adaptive flow is:
+
+- run the prefill scout once, unless `--completion-stats-no-prefill-scout` is set,
+- run a pilot/probe at C=1,
+- probe the configured concurrency levels,
+- stop once aggregate generation throughput no longer improves by
+  `--completion-stats-min-improvement` for `--completion-stats-patience` levels,
+- collect additional runs at the selected concurrency until
+  `--completion-stats-min-results` completed answers are available.
+
+The final report prints per-concurrency probe rows and a selected-concurrency
+summary with completion-token avg/p50/p90/p99, elapsed time, TTFT, aggregate
+generation tok/s, max-token hits, and correctness rate when scoring is enabled.
+Correctness is scored by default from the final non-empty answer line using
+`--completion-stats-correct-regex`; this matches the GLM dense-MLA vs NSA
+methodology where mentioning the right country during reasoning is not enough.
+
+If `--max-tokens` is not explicitly provided in this mode, the tool defaults to
+the built-in profile default, currently `40000` for `estonia`. Override it for
+shorter tasks. `--prompt` and `--prompt-file` remain available for custom
+completion-token statistics, but the reproducible bundled task should use
+`--test-profile estonia`.
 
 ### Client Latency Metrics
 
