@@ -4066,6 +4066,15 @@ def parse_token_value(s: str) -> int:
     return int(s)
 
 
+def default_cell_warmup_timeout_seconds(context_tokens: int) -> float:
+    """Scale decode-cell warmup timeout for long-context prefill/JIT startup."""
+    if context_tokens >= 128 * 1024:
+        return 180.0
+    if context_tokens >= 64 * 1024:
+        return 120.0
+    return 60.0
+
+
 def generate_padding_text(target_tokens: int) -> str:
     target_chars = target_tokens * CHARS_PER_TOKEN
     lines = []
@@ -5950,6 +5959,7 @@ async def run_one_cell(
     ignore_eos: bool = True,
     request_count: int = 0,
     warmup_request_count: int = 0,
+    cell_warmup_timeout_seconds: Optional[float] = None,
 ) -> CellResult:
     messages = build_messages(context_tokens, context_text)
     stream_options = {"include_usage": True}
@@ -6482,7 +6492,11 @@ async def run_one_cell(
     metrics_interval = 1.0
     min_warmup_seconds = 2.0     # minimum warmup (CUDA graph etc.)
     ready_stable_seconds = 3.0   # require sustained scheduler state
-    max_warmup_seconds = 60.0    # give up waiting for full concurrency
+    max_warmup_seconds = (
+        cell_warmup_timeout_seconds
+        if cell_warmup_timeout_seconds and cell_warmup_timeout_seconds > 0
+        else default_cell_warmup_timeout_seconds(context_tokens)
+    )
     last_metrics_time = 0.0
     gen_throughput_samples = []
     # For vLLM: compute throughput rate from generation_tokens counter
@@ -9225,6 +9239,7 @@ async def run_benchmark(args):
                     ignore_eos=not args.respect_eos,
                     request_count=0,
                     warmup_request_count=0,
+                    cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
                 )
                 state.results.pop((first_ctx, first_conc), None)
                 state.errors.pop((first_ctx, first_conc), None)
@@ -9286,6 +9301,7 @@ async def run_benchmark(args):
                             ignore_eos=not args.respect_eos,
                             request_count=args.request_count,
                             warmup_request_count=args.warmup_request_count,
+                            cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
                         )
                         if result.aggregate_tps == -2:
                             state.results[(ctx, conc)] = -2
@@ -9357,6 +9373,7 @@ async def run_benchmark(args):
                             ignore_eos=not args.respect_eos,
                             request_count=measured_requests,
                             warmup_request_count=warmup_requests,
+                            cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
                         )
                         result.benchmark_mode = "burst-e2e"
                         if result.aggregate_tps == -2:
@@ -9974,6 +9991,8 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
             "burst_warmup_request_count": getattr(args, "burst_warmup_request_count", 0),
             "burst_requests_per_concurrency": getattr(args, "burst_requests_per_concurrency", 5),
             "decode_warmup_seconds": getattr(args, "decode_warmup_seconds", 0),
+            "cell_warmup_timeout_seconds": getattr(args, "cell_warmup_timeout_seconds", 0),
+            "cell_warmup_timeout_policy": "<=32k:60s,64k:120s,>=128k:180s when override is 0",
             "show_capacity_limited_values": getattr(args, "show_capacity_limited_values", False),
             "max_tokens": args.max_tokens,
             "ignore_eos": not getattr(args, "respect_eos", False),
@@ -10298,6 +10317,11 @@ def parse_args():
              "Use 20 for short exact decode matrices on speculative stacks."
     )
     parser.add_argument(
+        "--cell-warmup-timeout-seconds", type=float, default=0.0,
+        help="Override per-cell readiness warmup timeout. 0 = auto by context "
+             "(<=32k: 60s, 64k: 120s, >=128k: 180s)."
+    )
+    parser.add_argument(
         "--prefill-duration", type=float, default=10.0,
         help="Duration per standalone prefill context in seconds. Only used with "
              "--standalone-prefill. (default: 10)"
@@ -10428,6 +10452,8 @@ def parse_args():
         parser.error("--burst-warmup-request-count must be >= 0")
     if args.burst_requests_per_concurrency < 1:
         parser.error("--burst-requests-per-concurrency must be >= 1")
+    if args.cell_warmup_timeout_seconds < 0:
+        parser.error("--cell-warmup-timeout-seconds must be >= 0")
     if args.hw_gpu_limit < 1:
         parser.error("--hw-gpu-limit must be >= 1")
     if args.prompt and args.prompt_file:
