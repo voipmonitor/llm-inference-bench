@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.13 - 2026-05-09
+
+### Repository transfer
+
+- Updated the auto-update source URL to the canonical `local-inference-lab/llm-inference-bench` repository after the GitHub transfer.
+
 ## 0.4.12 - 2026-05-06
 
 ### Prefill-only profiling

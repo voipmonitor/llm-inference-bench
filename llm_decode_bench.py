@@ -54,7 +54,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.12"
+VERSION = "0.4.13"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -10104,7 +10104,7 @@ def _restore_terminal():
             pass
 
 
-GITHUB_RAW_URL = "https://raw.githubusercontent.com/voipmonitor/llm-inference-bench/main/llm_decode_bench.py"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/local-inference-lab/llm-inference-bench/main/llm_decode_bench.py"
 
 
 def parse_version(v: str) -> tuple:
