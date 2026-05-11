@@ -19,6 +19,7 @@ Supports **SGLang** and **vLLM** engines (auto-detected). Works with any OpenAI-
 - **Server-side validation** — optionally scrapes Prometheus `/metrics` for vLLM/SGLang validation, queue, KV, and scheduler signals
 - **Live TUI dashboard** — adaptive Rich layout with compact modes for narrower terminals
 - **Live hardware panel** — GPU temperature, SM/memory utilization, VRAM usage, watts, clocks, PCIe rx/tx, plus CPU utilization/frequency and CPU package temperatures when exposed by the host
+- **Fabric diagnostics** — bundled CUDA/NCCL P2P diagnostic plus AMD CPU NUMA/xGMI bandwidth and latency diagnostic
 - **Event log** — right-side live history of warmup, readiness, skips, and cell completion while the dashboard redraws
 - **Prefill measurement** — integrated decode scout prefill by default, using client `prompt_tokens / TTFT`, with optional standalone cold-prefill profiling and live ETA for long-prefill rows
 - **Completion-token statistics mode** — adaptive task benchmark for long-answer quality/token-efficiency tests such as GLM dense MLA vs NSA; warms prefill once, finds the fastest decode concurrency, then collects completion-token distributions
@@ -89,6 +90,12 @@ python3 llm_decode_bench.py --skip-prefill --concurrency 1,2,4 --contexts 0
 
 # Manual KV cache budget (for vLLM where auto-detection is unreliable)
 python3 llm_decode_bench.py --port 5199 --kv-budget 692736
+
+# CUDA/NCCL P2P fabric diagnostic only
+python3 llm_decode_bench.py --p2pmark-only
+
+# AMD CPU socket fabric / NUMA diagnostic only
+python3 llm_decode_bench.py --amd-fabric-only
 ```
 
 ### Arguments
@@ -126,8 +133,16 @@ python3 llm_decode_bench.py --port 5199 --kv-budget 692736
 | `--no-hw-monitor` | `false` | Disable live hardware sampling |
 | `--p2pmark` | `false` | Run the bundled CUDA/NCCL fabric diagnostic before the LLM benchmark and embed it in JSON |
 | `--p2pmark-only` | `false` | Run only the bundled fabric diagnostic and exit |
+| `--p2pmark-detail` | `false` | Print expanded P2P matrices and per-pair topology/latency tables; default report is compact |
 | `--p2pmark-mode` | `all` | Diagnostic mode: `bandwidth`, `latency`, `allreduce`, or `all` |
 | `--p2pmark-bin` | bundled | Override path to the `llm_p2pmark` binary; default also has an embedded fallback |
+| `--amd-fabric` | `false` | Run the bundled AMD CPU NUMA/xGMI fabric diagnostic before the LLM benchmark and embed it in JSON |
+| `--amd-fabric-only` | `false` | Run only the AMD CPU fabric diagnostic and exit |
+| `--amd-fabric-detail` | `false` | Print separate full AMD fabric matrices; default output is compact |
+| `--amd-fabric-bin` | sidecar/PATH | Override path to the `llm_amd_fabric` helper |
+| `--amd-fabric-size-mb` | `512` | Buffer size per NUMA bandwidth measurement |
+| `--amd-fabric-latency-mb` | `256` | Pointer-chase latency working-set size per NUMA node |
+| `--amd-fabric-threads` | `0` | Threads per NUMA node for bandwidth tests; `0` auto-selects up to 64 CPUs per node |
 | `--output` | `benchmark_results.json` | Output file path |
 | `--kv-budget` | `0` | KV cache budget in tokens (0 = auto-detect) |
 | `--skip-prefill` | | Skip prefill reporting entirely |
@@ -355,6 +370,10 @@ dependent remote-read latency, and allreduce behavior across visible GPUs. The
 default allreduce sweep compares custom PCIe allreduce vs NCCL from 256 B to
 1 MiB, with winner and speedup ratio per size. Use
 `--p2pmark-allreduce-sizes-mb 1,2,4,8,16,32,64` for a larger MiB-only sweep.
+The default console report is intentionally compact: one fabric summary, one
+peer-distance topology table, one allreduce table, and one per-GPU compact view.
+Use `--p2pmark-detail` to print full matrices and pair-pattern tables; JSON
+output always contains the full raw data.
 
 For single-file installs, `llm_decode_bench.py` includes a compressed Linux
 x86_64 CUDA/NCCL fallback helper. If the sidecar binary is missing, the script
@@ -362,6 +381,43 @@ extracts it to `~/.cache/llm_decode_bench/bin/`. The fallback still depends on
 compatible runtime libraries (`libcudart.so.13` and `libnccl.so.2`). Build a
 local sidecar with `make -C tools/p2pmark` or pass `--p2pmark-bin` if the
 runtime does not match.
+
+For AMD dual-socket hosts, run:
+
+```bash
+python3 llm_decode_bench.py --amd-fabric-only
+python3 llm_decode_bench.py --amd-fabric --port 8000
+```
+
+The bundled `tools/amd_fabric/llm_amd_fabric` helper measures CPU execution
+NUMA node vs memory allocation NUMA node. It reports NUMA distance, read/write
+bandwidth, memcpy bandwidth, dependent pointer-chase latency, and a
+bidirectional remote-read test for 2-socket systems. Off-diagonal cells are the
+practical CPU-socket fabric signal.
+
+The default console report is compact: one summary panel and one combined
+`CPU node -> memory node` table. Use `--amd-fabric-detail` to print separate
+distance, read, write, memcpy, and latency matrices; JSON output always contains
+the full raw data.
+
+In the compact table, `N0->N0` means CPU threads pinned to NUMA node 0 accessing
+memory allocated on NUMA node 0. That is local socket traffic. Cross-socket
+fabric traffic is shown by off-diagonal rows such as `N0->N1` and `N1->N0`.
+The helper also reports bidirectional remote read/write/memcpy saturation, which
+runs both socket directions concurrently and is the more relevant aggregate
+fabric number.
+
+Linux does not expose a portable active xGMI socket-link count through standard
+sysfs/procfs interfaces. The report therefore labels active xGMI links as "not
+exposed" and treats measured remote NUMA bandwidth as authoritative. When
+Linux `perf list --details data_fabric` exposes cross-socket `link_N` counter
+slots, the report prints the number of visible DF link counter slots as a useful
+hint, but this is still not the same as a decoded active/trained xGMI link count.
+On AMD EPYC 9004/9005 2P platforms the expected link count is board-dependent;
+NPS1 reference topologies commonly use four board-wired xGMI links.
+
+Build the helper with `make -C tools/amd_fabric` or pass `--amd-fabric-bin` if
+you want to use a custom binary.
 
 ### Prefill Metrics
 

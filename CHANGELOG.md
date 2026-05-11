@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.15 - 2026-05-11
+
+### AMD CPU fabric diagnostics
+
+- Added bundled `tools/amd_fabric/llm_amd_fabric` helper source and Makefile for AMD dual-socket NUMA/fabric diagnostics.
+- Added `--amd-fabric` and `--amd-fabric-only` to measure CPU-node vs memory-node read/write/copy bandwidth and pointer-chase latency.
+- The AMD fabric report now includes NUMA distance, local/remote bandwidth summaries, bidirectional remote-read bandwidth on 2-socket systems, latency matrices, and xGMI reporting notes.
+- AMD fabric default console output is now compact: one summary panel plus one combined `CPU node -> memory node` table. `--amd-fabric-detail` prints the separate full matrices.
+- AMD fabric helper now auto-selects up to 64 CPUs per NUMA node instead of 32, and reports bidirectional remote read/write/memcpy saturation.
+- The AMD fabric report now parses Linux `perf list --details data_fabric` for visible cross-socket `link_N` counter slots when available.
+- Active xGMI socket-link count is explicitly marked as not exposed by standard Linux sysfs/procfs; measured off-diagonal NUMA bandwidth is used as the authoritative fabric signal.
+- JSON output now embeds `amd_fabric` results and startup diagnostics when the diagnostic is run.
+
+### P2P fabric diagnostics
+
+- Restored the full default `P2P memcpy bandwidth GB/s` matrix while keeping the compact fabric cards and topology/allreduce/per-GPU summaries.
+- Reworked the default P2P summary from a dense key/value table into compact human-readable cards.
+
 ## 0.4.14 - 2026-05-10
 
 ### Estonia profile live progress
@@ -19,6 +37,7 @@
 - Added bundled CUDA/NCCL fabric diagnostic source and binary target under `tools/p2pmark`.
 - Added `--p2pmark` and `--p2pmark-only` to measure CUDA peer memcpy and NCCL allreduce before inference and store the parsed result in JSON.
 - P2P diagnostic console output now includes peer-access matrix, P2P bandwidth matrix, per-GPU in/out summaries, peer-distance topology probe, single-writer fan-out, ring bandwidth, all-to-all fabric stress, remote-read latency, and all allreduce rows instead of only a compact one-line summary.
+- P2P diagnostic default output is now compact: fabric summary, peer-distance topology, allreduce table, and per-GPU compact view. `--p2pmark-detail` restores the expanded matrices and per-pair tables.
 - P2P diagnostic default allreduce sweep compares custom PCIe allreduce vs NCCL from 256 B to 1 MiB, with winner and ratio per size; larger MiB sweeps can be requested explicitly.
 - Startup now prints whether the NVIDIA P2P override is effectively loaded from `/proc/driver/nvidia/params`, and prints the suggested modprobe line when it is missing.
 - `llm_decode_bench.py` now embeds a compressed Linux x86_64 CUDA/NCCL `llm_p2pmark` fallback helper, so raw single-file installs can run `--p2pmark-only` when compatible CUDA/NCCL runtime libraries are present.

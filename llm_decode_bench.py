@@ -18,6 +18,7 @@ Usage:
 import argparse
 import asyncio
 import base64
+import glob
 import hashlib
 import json
 import os
@@ -55,7 +56,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.14"
+VERSION = "0.4.15"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -5212,6 +5213,7 @@ def print_p2p_override_status(console: Console, status: dict) -> None:
         title=render_title("NVIDIA P2P Override"),
         box=PANEL_BOX,
         border_style=style,
+        expand=False,
     ))
 
 
@@ -5325,8 +5327,11 @@ def run_p2pmark_diagnostic(args, console: Console) -> dict:
         mode_parts.append(f"latency iters={args.p2pmark_latency_iters}")
     if mode in ("all", "allreduce"):
         mode_parts.append(f"allreduce={allreduce_desc}")
-    console.print(f"[cyan]P2P diagnostic config:[/cyan] {'; '.join(mode_parts)}")
-    console.print(f"[cyan]Running P2P diagnostic:[/cyan] {' '.join(cmd)}")
+    console.print(f"[cyan]P2P config:[/cyan] mode={mode}; {'; '.join(mode_parts)}")
+    if getattr(args, "p2pmark_detail", False):
+        console.print(f"[cyan]Running P2P diagnostic:[/cyan] {' '.join(cmd)}")
+    else:
+        console.print(f"[cyan]Running P2P diagnostic:[/cyan] {os.path.basename(binary)} [dim](full command in JSON; use --p2pmark-detail to print it)[/dim]")
     started = time.monotonic()
     try:
         proc = subprocess.run(
@@ -5373,6 +5378,7 @@ def run_p2pmark_diagnostic(args, console: Console) -> dict:
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "data": parsed,
         "parse_error": parse_error,
+        "detail": bool(getattr(args, "p2pmark_detail", False)),
     })
     print_p2pmark_summary(console, result)
     return result
@@ -5537,6 +5543,249 @@ def _p2p_size_label(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
+def _p2p_avg_min_max(values: list[float]) -> tuple[float, float, float]:
+    clean = [float(v) for v in values if v is not None]
+    if not clean:
+        return 0.0, 0.0, 0.0
+    return mean(clean), min(clean), max(clean)
+
+
+def _p2p_fmt_triplet(values: list[float], unit: str, precision: int = 1) -> str:
+    avg, mn, mx = _p2p_avg_min_max(values)
+    return f"{avg:.{precision}f}/{mn:.{precision}f}/{mx:.{precision}f} {unit}"
+
+
+def _p2p_offdiag_values(matrix: list[list[float]]) -> list[float]:
+    return [
+        float(matrix[i][j])
+        for i in range(len(matrix))
+        for j in range(len(matrix[i]))
+        if i != j
+    ]
+
+
+def _p2p_peer_access_summary(peer: list[list[int]]) -> tuple[str, bool]:
+    if not peer:
+        return "not reported", False
+    total = 0
+    enabled = 0
+    missing = []
+    for i, row in enumerate(peer):
+        for j, value in enumerate(row):
+            if i == j:
+                continue
+            total += 1
+            if int(value):
+                enabled += 1
+            else:
+                missing.append(f"G{i}->G{j}")
+    if enabled == total:
+        return f"all enabled ({enabled}/{total})", True
+    return f"{enabled}/{total} enabled; missing {', '.join(missing[:6])}", False
+
+
+def _p2p_best_allreduce_row(rows: list[dict]) -> dict:
+    if not rows:
+        return {}
+    return max(rows, key=lambda r: float(r.get("best_bus_bw_gbps", r.get("bus_bw_gbps", 0.0))))
+
+
+def _p2p_allreduce_table(rows: list[dict]) -> Table:
+    ar_table = Table(
+        title=render_title("Allreduce: custom PCIe vs NCCL"),
+        title_justify="left",
+        box=REPORT_BOX,
+        border_style=SUBTLE_BORDER,
+        header_style=f"bold {PHOSPHOR_DIM}",
+    )
+    ar_table.add_column("size", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+    ar_table.add_column("custom us", justify="right", no_wrap=True)
+    ar_table.add_column("NCCL us", justify="right", no_wrap=True)
+    ar_table.add_column("winner", justify="right", no_wrap=True)
+    ar_table.add_column("speedup", justify="right", no_wrap=True)
+    ar_table.add_column("bus GB/s", justify="right", no_wrap=True)
+    for row in rows:
+        size_bytes = row.get("size_bytes")
+        if size_bytes is None:
+            size_bytes = int(row.get("size_mb", 0)) * 1024 * 1024
+        winner = row.get("winner", "nccl")
+        ar_table.add_row(
+            _p2p_size_label(size_bytes),
+            f"{float(row.get('custom_us', 0.0)):,.1f}",
+            f"{float(row.get('nccl_us', row.get('avg_us', 0.0))):,.1f}",
+            "[green]custom[/green]" if winner == "custom" else "[cyan]NCCL[/cyan]",
+            f"{float(row.get('ratio', 1.0)):.1f}x",
+            f"{float(row.get('best_bus_bw_gbps', row.get('bus_bw_gbps', 0.0))):.1f}",
+        )
+    return ar_table
+
+
+def _p2p_compact_summary_renderables(result: dict, data: dict) -> list:
+    peer_text, peer_ok = _p2p_peer_access_summary(data.get("peer_access", []) or [])
+    run_lines = [
+        f"[bold]{data.get('gpu_count')}[/bold] GPUs used / {data.get('visible_gpu_count')} visible",
+        f"mode: [bold]{data.get('mode', result.get('mode', ''))}[/bold]",
+        f"peer access: {'[green]' + peer_text + '[/green]' if peer_ok else '[' + PHOSPHOR_WARN + ']' + peer_text + '[/]'}",
+    ]
+    if data.get("bandwidth_gbps"):
+        run_lines.append(f"topology: {data.get('size_mb')} MiB × {data.get('iters')} timed + {data.get('warmup')} warmup")
+    if data.get("latency"):
+        run_lines.append(f"latency: {data.get('latency_iters')} dependent reads")
+    if result.get("elapsed_seconds") is not None:
+        run_lines.append(f"elapsed: {float(result.get('elapsed_seconds', 0.0)):.1f}s")
+
+    bandwidth_lines = []
+    bw = data.get("bandwidth_gbps", []) or []
+    if bw:
+        bandwidth_lines.append(f"1:1 P2P: [bold]{_p2p_fmt_triplet(_p2p_offdiag_values(bw), 'GB/s')}[/bold] avg/min/max")
+    topo = data.get("bandwidth_topology", {}) or {}
+    ring = topo.get("ring", {}) or {}
+    if ring:
+        bandwidth_lines.append(
+            f"ring: [bold]{float(ring.get('avg_gbps', 0.0)):.1f}[/bold] GB/s/GPU, "
+            f"{float(ring.get('total_gbps', 0.0)):.1f} GB/s total"
+        )
+    single = topo.get("single_writer_gbps", []) or []
+    if single:
+        bandwidth_lines.append(f"single writer: [bold]{_p2p_fmt_triplet(single, 'GB/s')}[/bold]")
+    a2a = topo.get("all_to_all_gpu_gbps", []) or []
+    if a2a:
+        bandwidth_lines.append(
+            f"all-to-all: [bold]{_p2p_fmt_triplet(a2a, 'GB/s')}[/bold], "
+            f"{float(topo.get('all_to_all_total_gbps', 0.0)):.1f} GB/s total"
+        )
+    if not bandwidth_lines:
+        bandwidth_lines.append("[dim]not measured in this mode[/dim]")
+
+    score_lines = []
+    if topo:
+        score_lines.append(
+            f"PCIe link score: [bold]{float(topo.get('pcie_link_score', 0.0)):.2f}[/bold]"
+        )
+        score_lines.append(
+            f"dense fabric score: [bold]{float(topo.get('dense_interconnect_score', 0.0)):.2f}[/bold]"
+        )
+        score_lines.append("[dim]1.00 is ideal for the measured 1:1 baseline[/dim]")
+
+    latency_lines = []
+    latency = data.get("latency", {}) or {}
+    if latency:
+        latency_lines.append(
+            f"isolated: [bold]{float(latency.get('avg_sequential_us', 0.0)):.2f} us[/bold] avg, "
+            f"{float(latency.get('min_sequential_us', 0.0)):.2f} us min"
+        )
+        latency_lines.append(
+            f"full load: [bold]{float(latency.get('effective_full_load_us', 0.0)):.2f} us[/bold] effective, "
+            f"{float(latency.get('mean_full_load_us', 0.0)):.2f} us mean"
+        )
+    else:
+        latency_lines.append("[dim]not measured in this mode[/dim]")
+
+    allreduce_lines = []
+    rows = data.get("allreduce", []) or []
+    if rows:
+        best = _p2p_best_allreduce_row(rows)
+        size_bytes = best.get("size_bytes", int(best.get("size_mb", 0)) * 1024 * 1024)
+        winner = best.get("winner", "nccl")
+        best_us = float(best.get(f"{winner}_us", best.get("avg_us", 0.0)))
+        allreduce_lines.append(
+            f"best: [bold]{_p2p_size_label(size_bytes)} via {winner}[/bold]"
+        )
+        allreduce_lines.append(
+            f"{best_us:.1f} us, {float(best.get('best_bus_bw_gbps', 0.0)):.1f} bus GB/s, "
+            f"{float(best.get('ratio', 1.0)):.1f}x"
+        )
+        first_size = rows[0].get("size_bytes", int(rows[0].get("size_mb", 0)) * 1024 * 1024)
+        last_size = rows[-1].get("size_bytes", int(rows[-1].get("size_mb", 0)) * 1024 * 1024)
+        if first_size == last_size:
+            sweep_text = f"{_p2p_size_label(first_size)} ({len(rows)} size)"
+        else:
+            sweep_text = f"{_p2p_size_label(first_size)}..{_p2p_size_label(last_size)} ({len(rows)} sizes)"
+        allreduce_lines.append(f"sweep: {sweep_text}")
+    else:
+        allreduce_lines.append("[dim]not measured in this mode[/dim]")
+
+    cards = [
+        Panel("\n".join(run_lines), title=render_title("Run"), box=PANEL_BOX, border_style=SUBTLE_BORDER, expand=False),
+        Panel("\n".join(bandwidth_lines), title=render_title("Bandwidth"), box=PANEL_BOX, border_style=SUBTLE_BORDER, expand=False),
+        Panel("\n".join(latency_lines), title=render_title("Latency"), box=PANEL_BOX, border_style=SUBTLE_BORDER, expand=False),
+        Panel("\n".join(allreduce_lines), title=render_title("Allreduce"), box=PANEL_BOX, border_style=SUBTLE_BORDER, expand=False),
+    ]
+    if score_lines:
+        cards.append(Panel("\n".join(score_lines), title=render_title("Scores"), box=PANEL_BOX, border_style=SUBTLE_BORDER, expand=False))
+    return cards
+
+
+def _p2p_distance_compact_table(topo: dict, latency: dict) -> Table:
+    table = Table(
+        title=render_title("Topology by peer distance"),
+        title_justify="left",
+        box=REPORT_BOX,
+        border_style=SUBTLE_BORDER,
+        header_style=f"bold {PHOSPHOR_DIM}",
+    )
+    table.add_column("dist", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+    table.add_column("write avg", justify="right", no_wrap=True)
+    table.add_column("write total", justify="right", no_wrap=True)
+    table.add_column("read avg", justify="right", no_wrap=True)
+    staggered = topo.get("staggered", []) or []
+    read_values = latency.get("staggered_avg_us", []) if latency else []
+    for idx, item in enumerate(staggered):
+        result = item.get("result", {}) or {}
+        read_value = read_values[idx] if idx < len(read_values) else None
+        table.add_row(
+            f"+{int(item.get('offset', idx + 1))}",
+            f"{float(result.get('avg_gbps', 0.0)):.1f} GB/s",
+            f"{float(result.get('total_gbps', 0.0)):.1f} GB/s",
+            f"{float(read_value):.2f} us" if read_value is not None else "—",
+        )
+    return table
+
+
+def _p2p_gpu_compact_table(data: dict) -> Table:
+    bw = data.get("bandwidth_gbps", []) or []
+    topo = data.get("bandwidth_topology", {}) or {}
+    latency = data.get("latency", {}) or {}
+    n = int(data.get("gpu_count") or len(bw) or 0)
+    table = Table(
+        title=render_title("Per-GPU compact view"),
+        title_justify="left",
+        box=REPORT_BOX,
+        border_style=SUBTLE_BORDER,
+        header_style=f"bold {PHOSPHOR_DIM}",
+    )
+    table.add_column("GPU", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+    table.add_column("seq out/in GB/s", justify="right", no_wrap=True)
+    table.add_column("fanout GB/s", justify="right", no_wrap=True)
+    table.add_column("a2a GB/s", justify="right", no_wrap=True)
+    table.add_column("read iso/full us", justify="right", no_wrap=True)
+    fanout = topo.get("single_writer_gbps", []) or []
+    a2a = topo.get("all_to_all_gpu_gbps", []) or []
+    seq_lat = latency.get("sequential_us", []) or []
+    full_lat = latency.get("all_read_all_peers_us", []) or []
+    for i in range(n):
+        if bw and i < len(bw):
+            out_vals = [float(bw[i][j]) for j in range(len(bw[i])) if j != i]
+            in_vals = [float(bw[j][i]) for j in range(len(bw)) if j != i and i < len(bw[j])]
+            out_in = f"{mean(out_vals):.1f}/{mean(in_vals):.1f}" if out_vals and in_vals else "—"
+        else:
+            out_in = "—"
+        if seq_lat and i < len(seq_lat):
+            iso_vals = [float(seq_lat[i][j]) for j in range(len(seq_lat[i])) if j != i]
+            iso = mean(iso_vals) if iso_vals else None
+        else:
+            iso = None
+        full = float(full_lat[i]) if i < len(full_lat) else None
+        table.add_row(
+            f"G{i}",
+            out_in,
+            f"{float(fanout[i]):.1f}" if i < len(fanout) else "—",
+            f"{float(a2a[i]):.1f}" if i < len(a2a) else "—",
+            f"{iso:.2f}/{full:.2f}" if iso is not None and full is not None else "—",
+        )
+    return table
+
+
 def print_p2pmark_summary(console: Console, result: dict) -> None:
     if result.get("status") != "ok":
         console.print(Panel(
@@ -5550,6 +5799,42 @@ def print_p2pmark_summary(console: Console, result: dict) -> None:
         return
     data = result.get("data", {})
     summary = data.get("bandwidth_summary", {}) or {}
+    detail = bool(result.get("detail"))
+    if not detail:
+        _print_p2p_columns(console, _p2p_compact_summary_renderables(result, data))
+        peer_text, peer_ok = _p2p_peer_access_summary(data.get("peer_access", []) or [])
+        if not peer_ok and data.get("peer_access"):
+            console.print(_p2p_matrix_table(
+                "CUDA peer access issues",
+                data.get("peer_access", []),
+                lambda value: "[green]yes[/green]" if int(value) else f"[{PHOSPHOR_WARN}]no[/]",
+                diag="self",
+            ))
+        bw = data.get("bandwidth_gbps", []) or []
+        if bw:
+            console.print(_p2p_matrix_table(
+                "P2P memcpy bandwidth GB/s",
+                bw,
+                lambda value: f"{float(value):.1f}",
+                diag="local",
+            ))
+        compact_tables = []
+        topo = data.get("bandwidth_topology", {}) or {}
+        latency = data.get("latency", {}) or {}
+        if topo.get("staggered"):
+            compact_tables.append(_p2p_distance_compact_table(topo, latency))
+        rows = data.get("allreduce", []) or []
+        if rows:
+            compact_tables.append(_p2p_allreduce_table(rows))
+        _print_p2p_columns(console, compact_tables)
+        if data.get("bandwidth_gbps") or topo or latency:
+            console.print(_p2p_gpu_compact_table(data))
+        console.print(
+            "[dim]Use --p2pmark-detail for full peer matrices, per-pair patterns, and expanded latency tables. "
+            "The JSON output always contains the full raw diagnostic data.[/dim]"
+        )
+        return
+
     lines = [
         f"GPUs: {data.get('gpu_count')} visible={data.get('visible_gpu_count')}",
     ]
@@ -5738,6 +6023,438 @@ def print_p2pmark_summary(console: Console, result: dict) -> None:
         console.print(ar_table)
 
 
+def default_amd_fabric_bin() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "amd_fabric", "llm_amd_fabric")
+
+
+def resolve_amd_fabric_bin(path: str, console: Console | None = None) -> str:
+    if path:
+        return path
+    candidate = default_amd_fabric_bin()
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    found = shutil.which("llm_amd_fabric")
+    if found:
+        return found
+    makefile = os.path.join(os.path.dirname(candidate), "Makefile")
+    if os.path.isfile(makefile) and shutil.which("make") and shutil.which("g++"):
+        proc = subprocess.run(
+            ["make", "-C", os.path.dirname(candidate)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if proc.returncode == 0 and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            if console:
+                console.print("[dim]Built AMD fabric helper from tools/amd_fabric.[/dim]")
+            return candidate
+        if console:
+            console.print(f"[{PHOSPHOR_WARN}]AMD fabric helper build failed:[/] {proc.stderr.strip()[:500]}")
+    return candidate
+
+
+def _read_first_existing(paths: list[str], max_chars: int = 20000) -> str:
+    for path in paths:
+        text = _read_text_file(path, max_chars=max_chars)
+        if text:
+            return text
+    return ""
+
+
+def detect_amd_fabric_topology() -> dict:
+    lscpu = _diag_command(["lscpu"], timeout=3.0).get("stdout", "")
+    dmi = _diag_command(["dmidecode", "-t", "system", "-t", "baseboard", "-t", "processor"], timeout=5.0).get("stdout", "")
+    perf_details = _diag_command(["perf", "list", "--details", "data_fabric"], timeout=5.0).get("stdout", "") if shutil.which("perf") else ""
+    node_distances = []
+    for path in sorted(glob.glob("/sys/devices/system/node/node*/distance")):
+        vals = _read_text_file(path).strip()
+        if vals:
+            node_distances.append([int(x) for x in vals.split() if x.isdigit()])
+    node_cpulists = []
+    for path in sorted(glob.glob("/sys/devices/system/node/node*/cpulist")):
+        node_cpulists.append(_read_text_file(path).strip())
+
+    cpu_model = ""
+    for line in lscpu.splitlines():
+        if line.startswith("Model name:"):
+            cpu_model = line.split(":", 1)[1].strip()
+            break
+    system_product = ""
+    board_product = ""
+    current = ""
+    for line in dmi.splitlines():
+        if line.startswith("System Information"):
+            current = "system"
+        elif line.startswith("Base Board Information"):
+            current = "board"
+        elif line.startswith("Handle "):
+            current = ""
+        elif "Product Name:" in line and current == "system":
+            system_product = line.split(":", 1)[1].strip()
+        elif "Product Name:" in line and current == "board":
+            board_product = line.split(":", 1)[1].strip()
+
+    is_amd_epyc = "AuthenticAMD" in lscpu and "EPYC" in cpu_model
+    expected = "unknown"
+    note = "Linux does not expose a portable active xGMI socket-link count."
+    if is_amd_epyc and re.search(r"\b9\d{3}[A-Z]?\b", cpu_model):
+        expected = "3 or 4 board-wired xGMI links; AMD 9004/9005 2P NPS1 reference topology uses 4"
+        note = (
+            "Active xGMI link count is not exposed through standard Linux sysfs. "
+            "Report measured remote NUMA bandwidth as the authoritative fabric signal."
+        )
+    elif is_amd_epyc:
+        expected = "board-dependent EPYC xGMI links"
+
+    link_slots = sorted({
+        int(m.group(1))
+        for m in re.finditer(r"link_(\d+)", perf_details)
+    })
+    hsmp_root = "/sys/devices/platform/AMDI0097:00"
+    hsmp = {
+        "available": os.path.exists("/dev/hsmp") or os.path.exists(hsmp_root),
+        "protocol_version": _read_text_file(os.path.join(hsmp_root, "protocol_version")).strip(),
+        "smu_fw_version": _read_text_file(os.path.join(hsmp_root, "smu_fw_version")).strip(),
+        "fclk_mhz": _read_text_file(os.path.join(hsmp_root, "fclk_input")).strip(),
+        "mclk_mhz": _read_text_file(os.path.join(hsmp_root, "mclk_input")).strip(),
+        "ddr_max_bw_gbps": _read_text_file(os.path.join(hsmp_root, "ddr_max_bw")).strip(),
+    }
+
+    return {
+        "cpu_model": cpu_model,
+        "system_product": system_product,
+        "board_product": board_product,
+        "node_distances": node_distances,
+        "node_cpulists": node_cpulists,
+        "hsmp": hsmp,
+        "data_fabric_perf_link_counter_slots": link_slots,
+        "xgmi": {
+            "reported_active_links": None,
+            "expected_links": expected,
+            "source": (
+                "inferred from CPU family plus Linux perf data_fabric link counter slots; "
+                "active trained xGMI lane count still requires platform-specific DF/SMN decoding"
+            ),
+            "note": note,
+        },
+    }
+
+
+def run_amd_fabric_diagnostic(args, console: Console) -> dict:
+    binary = resolve_amd_fabric_bin(getattr(args, "amd_fabric_bin", ""), console)
+    result = {
+        "status": "not_run",
+        "binary": binary,
+        "topology": detect_amd_fabric_topology(),
+    }
+    if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        result.update({
+            "status": "missing_binary",
+            "error": f"AMD fabric helper not found or not executable: {binary}",
+            "suggestion": "build it with: make -C tools/amd_fabric",
+        })
+        console.print(Panel(
+            f"[{PHOSPHOR_WARN}]{result['error']}[/]\n{result['suggestion']}",
+            title=render_title("AMD CPU Fabric"),
+            box=PANEL_BOX,
+            border_style=PHOSPHOR_WARN,
+        ))
+        return result
+    cmd = [
+        binary,
+        "--size-mb", str(args.amd_fabric_size_mb),
+        "--latency-mb", str(args.amd_fabric_latency_mb),
+        "--iters", str(args.amd_fabric_iters),
+        "--warmup", str(args.amd_fabric_warmup),
+        "--threads", str(args.amd_fabric_threads),
+        "--latency-iters", str(args.amd_fabric_latency_iters),
+    ]
+    if args.amd_fabric_max_nodes > 0:
+        cmd.extend(["--max-nodes", str(args.amd_fabric_max_nodes)])
+    console.print(
+        f"[cyan]AMD fabric:[/cyan] {args.amd_fabric_size_mb} MiB bw, "
+        f"threads={args.amd_fabric_threads or 'auto'}, iters={args.amd_fabric_iters}, "
+        f"lat={args.amd_fabric_latency_mb} MiB/{args.amd_fabric_latency_iters} reads"
+    )
+    if getattr(args, "amd_fabric_detail", False):
+        console.print(f"[cyan]Running AMD fabric diagnostic:[/cyan] {' '.join(cmd)}")
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=args.amd_fabric_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        result.update({
+            "status": "timeout",
+            "cmd": cmd,
+            "timeout_seconds": args.amd_fabric_timeout,
+            "stdout": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
+            "stderr": (exc.stderr or "").strip() if isinstance(exc.stderr, str) else "",
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        })
+        print_amd_fabric_summary(console, result)
+        return result
+    except Exception as exc:
+        result.update({
+            "status": "error",
+            "cmd": cmd,
+            "error": f"{type(exc).__name__}: {exc}",
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+        })
+        print_amd_fabric_summary(console, result)
+        return result
+
+    stdout = proc.stdout.strip()
+    parsed = {}
+    parse_error = ""
+    if stdout:
+        try:
+            parsed = json.loads(stdout.splitlines()[-1])
+        except Exception as exc:
+            parse_error = f"{type(exc).__name__}: {exc}"
+    result.update({
+        "status": "ok" if proc.returncode == 0 and parsed else "failed",
+        "cmd": cmd,
+        "returncode": proc.returncode,
+        "stdout": stdout,
+        "stderr": proc.stderr.strip(),
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "data": parsed,
+        "parse_error": parse_error,
+        "detail": bool(getattr(args, "amd_fabric_detail", False)),
+    })
+    print_amd_fabric_summary(console, result)
+    return result
+
+
+def _matrix_values(matrix: list[list[float]], *, diag: bool) -> list[float]:
+    return [
+        float(matrix[i][j])
+        for i in range(len(matrix))
+        for j in range(len(matrix[i]))
+        if diag or i != j
+    ]
+
+
+def _amd_matrix_table(title: str, matrix: list[list], fmt, unit: str = "") -> Table:
+    table = Table(
+        title=render_title(title),
+        title_justify="left",
+        box=REPORT_BOX,
+        border_style=SUBTLE_BORDER,
+        header_style=f"bold {PHOSPHOR_DIM}",
+    )
+    table.add_column("CPU \\ Mem", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+    n = len(matrix)
+    for i in range(n):
+        table.add_column(f"N{i}", justify="right", no_wrap=True)
+    for i, row_values in enumerate(matrix):
+        row = [f"N{i}"]
+        for value in row_values:
+            row.append(f"{fmt(float(value))}{unit}")
+        table.add_row(*row)
+    return table
+
+
+def _amd_pair_table(data: dict) -> Table:
+    distance = data.get("distance", []) or []
+    read = data.get("read_gbps", []) or []
+    write = data.get("write_gbps", []) or []
+    copy = data.get("copy_gbps", []) or []
+    latency = data.get("latency_us", []) or []
+    n = max(len(distance), len(read), len(write), len(copy), len(latency))
+    table = Table(
+        title=render_title("NUMA fabric: CPU node -> memory node"),
+        title_justify="left",
+        box=REPORT_BOX,
+        border_style=SUBTLE_BORDER,
+        header_style=f"bold {PHOSPHOR_DIM}",
+    )
+    table.add_column("path", style=f"bold {PHOSPHOR_SOFT}", no_wrap=True)
+    table.add_column("dist", justify="right", no_wrap=True)
+    table.add_column("read", justify="right", no_wrap=True)
+    table.add_column("write", justify="right", no_wrap=True)
+    table.add_column("memcpy", justify="right", no_wrap=True)
+    table.add_column("lat", justify="right", no_wrap=True)
+    table.add_column("kind", no_wrap=True)
+    for cpu_node in range(n):
+        for mem_node in range(n):
+            row_style = "dim" if cpu_node == mem_node else ""
+
+            def cell(matrix, fmt, default="—"):
+                if cpu_node < len(matrix) and mem_node < len(matrix[cpu_node]):
+                    return fmt(float(matrix[cpu_node][mem_node]))
+                return default
+
+            table.add_row(
+                f"N{cpu_node}->N{mem_node}",
+                cell(distance, lambda v: f"{int(v)}"),
+                cell(read, lambda v: f"{v:.1f} GB/s"),
+                cell(write, lambda v: f"{v:.1f} GB/s"),
+                cell(copy, lambda v: f"{v:.1f} GB/s"),
+                cell(latency, lambda v: f"{v:.2f} us"),
+                "local" if cpu_node == mem_node else "remote",
+                style=row_style,
+            )
+    return table
+
+
+def print_amd_fabric_summary(console: Console, result: dict) -> None:
+    if result.get("status") != "ok":
+        console.print(Panel(
+            f"status={result.get('status')}\n"
+            f"returncode={result.get('returncode', 'n/a')}\n"
+            f"{result.get('stderr') or result.get('error') or result.get('parse_error') or ''}",
+            title=render_title("AMD CPU Fabric"),
+            box=PANEL_BOX,
+            border_style=PHOSPHOR_WARN,
+        ))
+        return
+    data = result.get("data", {}) or {}
+    topo = result.get("topology", {}) or {}
+    xgmi = topo.get("xgmi", {}) or {}
+    read = data.get("read_gbps", []) or []
+    write = data.get("write_gbps", []) or []
+    copy = data.get("copy_gbps", []) or []
+    latency = data.get("latency_us", []) or []
+    detail = bool(result.get("detail"))
+    local_read = [float(read[i][i]) for i in range(len(read)) if i < len(read[i])] if read else []
+    remote_read = _matrix_values(read, diag=False) if read else []
+    local_lat = [float(latency[i][i]) for i in range(len(latency)) if i < len(latency[i])] if latency else []
+    remote_lat = _matrix_values(latency, diag=False) if latency else []
+
+    run_lines = [
+        topo.get("cpu_model") or "AMD CPU",
+        f"system: {topo.get('system_product') or 'unknown'}",
+        f"board: {topo.get('board_product') or 'unknown'}",
+        f"NUMA nodes: {data.get('numa_nodes')} | threads/node: {data.get('threads_per_node')}",
+        f"distance: {topo.get('node_distances') or data.get('distance')}",
+    ]
+    xgmi_lines = [
+        f"active links: [bold]{xgmi.get('reported_active_links') or 'not exposed'}[/bold]",
+        f"expected: {xgmi.get('expected_links', 'unknown')}",
+        f"[dim]{xgmi.get('note', '')}[/dim]",
+    ]
+    link_slots = topo.get("data_fabric_perf_link_counter_slots") or []
+    if link_slots:
+        xgmi_lines.append(f"perf DF link counter slots: {len(link_slots)} ({','.join(str(x) for x in link_slots)})")
+    hsmp = topo.get("hsmp") or {}
+    if hsmp.get("available"):
+        hsmp_bits = []
+        if hsmp.get("protocol_version"):
+            hsmp_bits.append(f"protocol={hsmp.get('protocol_version')}")
+        if hsmp.get("fclk_mhz"):
+            hsmp_bits.append(f"fclk={hsmp.get('fclk_mhz')} MHz")
+        if hsmp.get("mclk_mhz"):
+            hsmp_bits.append(f"mclk={hsmp.get('mclk_mhz')} MHz")
+        if hsmp.get("ddr_max_bw_gbps"):
+            hsmp_bits.append(f"ddr_max={hsmp.get('ddr_max_bw_gbps')} GB/s")
+        if hsmp_bits:
+            xgmi_lines.append("HSMP: " + ", ".join(hsmp_bits))
+    bw_lines = []
+    if local_read:
+        bw_lines.append(f"local read: [bold]{_p2p_fmt_triplet(local_read, 'GB/s')}[/bold]")
+    if remote_read:
+        bw_lines.append(f"remote read: [bold]{_p2p_fmt_triplet(remote_read, 'GB/s')}[/bold]")
+    if data.get("bidirectional_remote_read_gbps", 0):
+        bw_lines.append(f"bidirectional remote read: [bold]{float(data.get('bidirectional_remote_read_gbps', 0.0)):.1f} GB/s[/bold]")
+    if data.get("bidirectional_remote_write_gbps", 0):
+        bw_lines.append(f"bidirectional remote write: [bold]{float(data.get('bidirectional_remote_write_gbps', 0.0)):.1f} GB/s[/bold]")
+    if data.get("bidirectional_remote_copy_gbps", 0):
+        bw_lines.append(f"bidirectional remote memcpy: [bold]{float(data.get('bidirectional_remote_copy_gbps', 0.0)):.1f} GB/s[/bold]")
+    if write:
+        bw_lines.append(f"remote write: {_p2p_fmt_triplet(_matrix_values(write, diag=False), 'GB/s')}")
+    if copy:
+        bw_lines.append(f"remote copy: {_p2p_fmt_triplet(_matrix_values(copy, diag=False), 'GB/s')}")
+    lat_lines = []
+    if local_lat:
+        lat_lines.append(f"local: [bold]{_p2p_fmt_triplet(local_lat, 'us', precision=2)}[/bold]")
+    if remote_lat:
+        lat_lines.append(f"remote: [bold]{_p2p_fmt_triplet(remote_lat, 'us', precision=2)}[/bold]")
+
+    if not detail:
+        dist = topo.get("node_distances") or data.get("distance") or []
+        if (
+            len(dist) == 2
+            and len(dist[0]) == 2
+            and len(dist[1]) == 2
+            and int(dist[0][0]) == int(dist[1][1])
+            and int(dist[0][1]) == int(dist[1][0])
+        ):
+            distance_text = f"local={int(dist[0][0])}, remote={int(dist[0][1])}"
+        else:
+            distance_text = str(dist)
+        summary_lines = [
+            f"[bold]{topo.get('cpu_model') or 'AMD CPU'}[/bold]",
+            f"{topo.get('system_product') or 'unknown system'} / {topo.get('board_product') or 'unknown board'}",
+            f"NUMA nodes: [bold]{data.get('numa_nodes')}[/bold], threads/node: {data.get('threads_per_node')}, distance: {distance_text}",
+        ]
+        if remote_read:
+            summary_lines.append(f"remote read: [bold]{_p2p_fmt_triplet(remote_read, 'GB/s')}[/bold]")
+        saturation_parts = []
+        if data.get("bidirectional_remote_read_gbps", 0):
+            saturation_parts.append(f"read {float(data.get('bidirectional_remote_read_gbps', 0.0)):.1f}")
+        if data.get("bidirectional_remote_write_gbps", 0):
+            saturation_parts.append(f"write {float(data.get('bidirectional_remote_write_gbps', 0.0)):.1f}")
+        if data.get("bidirectional_remote_copy_gbps", 0):
+            saturation_parts.append(f"memcpy {float(data.get('bidirectional_remote_copy_gbps', 0.0)):.1f}")
+        if saturation_parts:
+            summary_lines.append(f"bidirectional saturation GB/s: [bold]{' / '.join(saturation_parts)}[/bold]")
+        if remote_lat:
+            summary_lines.append(f"remote latency: [bold]{_p2p_fmt_triplet(remote_lat, 'us', precision=2)}[/bold]")
+        link_slots = topo.get("data_fabric_perf_link_counter_slots") or []
+        if link_slots:
+            summary_lines.append(
+                f"DF perf link counters: [bold]{len(link_slots)} slots[/bold] "
+                f"[dim]({','.join(str(x) for x in link_slots)})[/dim]"
+            )
+        summary_lines.append(
+            f"xGMI active links: [bold]{xgmi.get('reported_active_links') or 'not exposed'}[/bold] "
+            "[dim](Linux does not report this portably)[/dim]"
+        )
+        console.print(Panel(
+            "\n".join(summary_lines),
+            title=render_title("AMD CPU Fabric"),
+            box=PANEL_BOX,
+            border_style=FRAME_BORDER,
+            expand=False,
+        ))
+        console.print(_amd_pair_table(data))
+        console.print(
+            "[dim]Remote rows are the CPU-socket fabric signal. "
+            "Use --amd-fabric-detail for separate full matrices. "
+            "Linux does not expose a portable active xGMI link count.[/dim]"
+        )
+        return
+
+    _print_p2p_columns(console, [
+        Panel("\n".join(run_lines), title=render_title("AMD CPU Fabric"), box=PANEL_BOX, border_style=SUBTLE_BORDER, expand=False),
+        Panel("\n".join(xgmi_lines), title=render_title("xGMI Links"), box=PANEL_BOX, border_style=SUBTLE_BORDER, expand=False),
+        Panel("\n".join(bw_lines or ["not measured"]), title=render_title("Bandwidth"), box=PANEL_BOX, border_style=SUBTLE_BORDER, expand=False),
+        Panel("\n".join(lat_lines or ["not measured"]), title=render_title("Latency"), box=PANEL_BOX, border_style=SUBTLE_BORDER, expand=False),
+    ])
+    if data.get("distance"):
+        console.print(_amd_matrix_table("NUMA distance", data.get("distance"), lambda v: f"{int(v)}"))
+    if read:
+        console.print(_amd_matrix_table("CPU read bandwidth GB/s", read, lambda v: f"{v:.1f}"))
+    if write:
+        console.print(_amd_matrix_table("CPU write bandwidth GB/s", write, lambda v: f"{v:.1f}"))
+    if copy:
+        console.print(_amd_matrix_table("CPU memcpy bandwidth GB/s", copy, lambda v: f"{v:.1f}"))
+    if latency:
+        console.print(_amd_matrix_table("Dependent pointer-chase latency us", latency, lambda v: f"{v:.2f}"))
+    console.print(
+        "[dim]Rows are CPU execution NUMA node; columns are memory allocation NUMA node. "
+        "Remote off-diagonal cells are the practical CPU-socket fabric signal. "
+        "xGMI active link count is not reported by standard Linux interfaces on this platform.[/dim]"
+    )
+
+
 def collect_startup_diagnostics(args, base_url: str) -> dict:
     env_prefixes = ("NCCL_", "VLLM_", "SGLANG_", "CUDA_", "OMP_")
     env = {
@@ -5768,6 +6485,7 @@ def collect_startup_diagnostics(args, base_url: str) -> dict:
         },
         "nvidia_p2p_override": getattr(args, "nvidia_p2p_override", detect_nvidia_p2p_override()),
         "p2pmark": getattr(args, "p2pmark_result", {}),
+        "amd_fabric": getattr(args, "amd_fabric_result", {}),
     }
     if shutil.which("nvidia-smi"):
         diagnostics["nvidia_smi_query"] = _diag_command([
@@ -9713,9 +10431,11 @@ async def run_completion_stats_benchmark(args) -> dict:
                     getattr(args, "nvidia_p2p_override", {}).get("effective", False)
                 ),
                 "p2pmark_status": getattr(args, "p2pmark_result", {}).get("status", "not_run"),
+                "amd_fabric_status": getattr(args, "amd_fabric_result", {}).get("status", "not_run"),
             },
             "nvidia_p2p_override": getattr(args, "nvidia_p2p_override", {}),
             "p2pmark": getattr(args, "p2pmark_result", {}),
+            "amd_fabric": getattr(args, "amd_fabric_result", {}),
             "prefill_scout": asdict(scout_result) if scout_result else None,
             "selected_concurrency": best_concurrency,
             "selected_summary": selected_summary,
@@ -9790,6 +10510,11 @@ async def run_benchmark(args):
         remember_startup(
             f"p2pmark status={args.p2pmark_result.get('status')} "
             f"mode={args.p2pmark_result.get('mode', '')}"
+        )
+    if getattr(args, "amd_fabric_result", {}).get("status") not in (None, "", "not_run"):
+        remember_startup(
+            f"amd_fabric status={args.amd_fabric_result.get('status')} "
+            f"nodes={args.amd_fabric_result.get('data', {}).get('numa_nodes', 'n/a')}"
         )
 
     # --kv-budget overrides --max-total-tokens
@@ -11672,10 +12397,12 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
                 getattr(args, "nvidia_p2p_override", {}).get("effective", False)
             ),
             "p2pmark_status": getattr(args, "p2pmark_result", {}).get("status", "not_run"),
+            "amd_fabric_status": getattr(args, "amd_fabric_result", {}).get("status", "not_run"),
         },
         "startup_diagnostics": getattr(args, "startup_diagnostics", {}),
         "nvidia_p2p_override": getattr(args, "nvidia_p2p_override", {}),
         "p2pmark": getattr(args, "p2pmark_result", {}),
+        "amd_fabric": getattr(args, "amd_fabric_result", {}),
         "event_log": getattr(args, "event_log", []),
         "prefill": prefill_summary,
         "results": [asdict(r) for r in actual_results],
@@ -12091,6 +12818,11 @@ def parse_args():
         help="Run only the bundled CUDA/NCCL P2P diagnostic and exit."
     )
     parser.add_argument(
+        "--p2pmark-detail", action="store_true",
+        help="Print expanded P2P matrices and per-pair topology/latency tables. "
+             "Default output is compact; JSON always keeps full raw diagnostics."
+    )
+    parser.add_argument(
         "--p2pmark-bin", default="",
         help="Path to llm_p2pmark binary. Default uses tools/p2pmark/llm_p2pmark "
              "next to this script, then PATH, then the embedded fallback helper."
@@ -12131,6 +12863,57 @@ def parse_args():
     parser.add_argument(
         "--p2pmark-timeout", type=float, default=300.0,
         help="Timeout for the P2P diagnostic subprocess in seconds. (default: 300)"
+    )
+    parser.add_argument(
+        "--amd-fabric", action="store_true",
+        help="Run the bundled AMD CPU NUMA/xGMI fabric diagnostic before the LLM benchmark "
+             "and embed the result in JSON."
+    )
+    parser.add_argument(
+        "--amd-fabric-only", action="store_true",
+        help="Run only the bundled AMD CPU NUMA/xGMI fabric diagnostic and exit."
+    )
+    parser.add_argument(
+        "--amd-fabric-detail", action="store_true",
+        help="Print separate AMD fabric matrices and expanded xGMI notes. "
+             "Default output is compact; JSON always keeps full raw diagnostics."
+    )
+    parser.add_argument(
+        "--amd-fabric-bin", default="",
+        help="Path to llm_amd_fabric binary. Default uses tools/amd_fabric/llm_amd_fabric "
+             "next to this script, then PATH, and auto-builds the sidecar when make/g++ are available."
+    )
+    parser.add_argument(
+        "--amd-fabric-size-mb", type=int, default=512,
+        help="Buffer size per NUMA bandwidth measurement in MiB. (default: 512)"
+    )
+    parser.add_argument(
+        "--amd-fabric-latency-mb", type=int, default=256,
+        help="Pointer-chase latency working-set size per NUMA node in MiB. (default: 256)"
+    )
+    parser.add_argument(
+        "--amd-fabric-iters", type=int, default=5,
+        help="Timed bandwidth iterations per CPU fabric measurement. (default: 5)"
+    )
+    parser.add_argument(
+        "--amd-fabric-warmup", type=int, default=1,
+        help="Warmup iterations per CPU fabric bandwidth measurement. (default: 1)"
+    )
+    parser.add_argument(
+        "--amd-fabric-threads", type=int, default=0,
+        help="Threads per NUMA node for bandwidth tests. 0 = auto from node CPU count. (default: 0)"
+    )
+    parser.add_argument(
+        "--amd-fabric-latency-iters", type=int, default=5000000,
+        help="Dependent remote-read iterations for each pointer-chase latency cell. (default: 5000000)"
+    )
+    parser.add_argument(
+        "--amd-fabric-max-nodes", type=int, default=0,
+        help="Limit NUMA nodes used by the AMD fabric diagnostic. 0 = all NUMA nodes. (default: 0)"
+    )
+    parser.add_argument(
+        "--amd-fabric-timeout", type=float, default=600.0,
+        help="Timeout for the AMD fabric diagnostic subprocess in seconds. (default: 600)"
     )
     parser.add_argument(
         "--respect-eos", action="store_true",
@@ -12190,6 +12973,8 @@ def parse_args():
         args.standalone_prefill = True
     if args.p2pmark_only:
         args.p2pmark = True
+    if args.amd_fabric_only:
+        args.amd_fabric = True
     if args.request_count < 0:
         parser.error("--request-count must be >= 0")
     if args.warmup_request_count < 0:
@@ -12223,6 +13008,22 @@ def parse_args():
             parser.error("--p2pmark-allreduce-sizes-mb must be 'full' or a comma-separated positive integer list")
         if any(int(x) <= 0 for x in args.p2pmark_allreduce_sizes_mb.split(",")):
             parser.error("--p2pmark-allreduce-sizes-mb values must be > 0")
+    if args.amd_fabric_size_mb < 1:
+        parser.error("--amd-fabric-size-mb must be >= 1")
+    if args.amd_fabric_latency_mb < 1:
+        parser.error("--amd-fabric-latency-mb must be >= 1")
+    if args.amd_fabric_iters < 1:
+        parser.error("--amd-fabric-iters must be >= 1")
+    if args.amd_fabric_warmup < 0:
+        parser.error("--amd-fabric-warmup must be >= 0")
+    if args.amd_fabric_threads < 0:
+        parser.error("--amd-fabric-threads must be >= 0")
+    if args.amd_fabric_latency_iters < 1:
+        parser.error("--amd-fabric-latency-iters must be >= 1")
+    if args.amd_fabric_max_nodes < 0:
+        parser.error("--amd-fabric-max-nodes must be >= 0")
+    if args.amd_fabric_timeout <= 0:
+        parser.error("--amd-fabric-timeout must be > 0")
     if args.prompt and args.prompt_file:
         parser.error("--prompt and --prompt-file are mutually exclusive")
     if args.test_profile and (args.prompt or args.prompt_file):
@@ -12288,20 +13089,31 @@ def main():
     check_for_update(console)
     args = parse_args()
     args.nvidia_p2p_override = detect_nvidia_p2p_override()
-    print_p2p_override_status(console, args.nvidia_p2p_override)
+    if not args.amd_fabric_only or args.p2pmark:
+        print_p2p_override_status(console, args.nvidia_p2p_override)
     if args.p2pmark:
         args.p2pmark_result = run_p2pmark_diagnostic(args, console)
     else:
         args.p2pmark_result = {"status": "not_run"}
-    if args.p2pmark_only:
+    if args.amd_fabric:
+        args.amd_fabric_result = run_amd_fabric_diagnostic(args, console)
+    else:
+        args.amd_fabric_result = {"status": "not_run"}
+    if args.p2pmark_only or args.amd_fabric_only:
+        modes = []
+        if args.p2pmark_only:
+            modes.append("p2pmark")
+        if args.amd_fabric_only:
+            modes.append("amd_fabric")
         output = {
             "metadata": {
                 "version": VERSION,
-                "mode": "p2pmark_only",
+                "mode": "_".join(modes) + "_only",
                 "timestamp": datetime.now().isoformat(),
             },
             "nvidia_p2p_override": args.nvidia_p2p_override,
             "p2pmark": args.p2pmark_result,
+            "amd_fabric": args.amd_fabric_result,
         }
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2)
