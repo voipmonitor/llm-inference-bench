@@ -124,6 +124,10 @@ python3 llm_decode_bench.py --port 5199 --kv-budget 692736
 | `--hw-monitor-interval` | `2` | Live CPU/GPU hardware sampling interval in seconds |
 | `--hw-gpu-limit` | `8` | Maximum GPUs shown in the live hardware panel |
 | `--no-hw-monitor` | `false` | Disable live hardware sampling |
+| `--p2pmark` | `false` | Run the bundled CUDA/NCCL fabric diagnostic before the LLM benchmark and embed it in JSON |
+| `--p2pmark-only` | `false` | Run only the bundled fabric diagnostic and exit |
+| `--p2pmark-mode` | `all` | Diagnostic mode: `bandwidth`, `latency`, `allreduce`, or `all` |
+| `--p2pmark-bin` | bundled | Override path to the `llm_p2pmark` binary; default also has an embedded fallback |
 | `--output` | `benchmark_results.json` | Output file path |
 | `--kv-budget` | `0` | KV cache budget in tokens (0 = auto-detect) |
 | `--skip-prefill` | | Skip prefill reporting entirely |
@@ -250,10 +254,18 @@ python3 llm_decode_bench.py --port 8001 --model GLM-5 \
     --profile-runs 30
 ```
 
-This sends exactly 30 measured requests with up to 8 requests in flight. The
-live display shows active requests, completion progress, recent answers, running
-completion-token percentiles, correctness rate, TTFT, and generation throughput
-while the run is still in progress.
+Without explicit profile controls, `estonia` defaults to `--profile-concurrency
+30 --profile-runs 30`; override these when the server cannot fit that much
+parallel work or when you want a smaller diagnostic run. The example above sends
+exactly 30 measured requests with up to 8 requests in flight. The
+live display shows the scout request, queued/launched/active request counts,
+active stream elapsed time, estimated live tokens, estimated live tok/s, recent
+final answers/excerpts, running completion-token percentiles, correctness rate,
+TTFT, generation throughput, and the same live GPU/CPU hardware panel used by
+the normal decode dashboard in the top-right area while the run is still in
+progress. The scout row is reported as prefix-cache/prefill measurement with
+prompt tokens, TTFT, and prefill tok/s; it is not scored as a normal answer.
+Press `q` to stop after the currently completed work and print a partial report.
 
 If `--profile-concurrency` is not set, the adaptive flow is:
 
@@ -277,6 +289,11 @@ the built-in profile default, currently `40000` for `estonia`. Override it for
 shorter tasks. `--prompt` and `--prompt-file` remain available for custom
 completion-token statistics, but the reproducible bundled task should use
 `--test-profile estonia`.
+
+If SGLang is running with DCP/CP and `/get_server_info` reports only the local KV
+budget, pass `--dcp-size N` or set `LLM_BENCH_DCP_SIZE=N`. For example, a local
+`max_total_num_tokens=200000` with `--dcp-size 4` is displayed and treated as an
+effective `800000` token KV budget.
 
 ### Client Latency Metrics
 
@@ -316,6 +333,35 @@ When hardware sampling is active, every measured decode cell also gets a compact
 hardware summary in JSON and in the final report. Startup diagnostics are saved
 to JSON as well: benchmark arguments, relevant `NCCL_`/`VLLM_`/`SGLANG_`/`CUDA_`
 environment variables, `uname`, GPU query output, and `nvidia-smi topo -m`.
+
+The benchmark also checks the NVIDIA runtime P2P override at startup by reading
+`/proc/driver/nvidia/params`, not just the modprobe file. A green startup panel
+means the expected `ForceP2P=0x11`, `RMForceP2PType=1`, `RMPcieP2PType=2`,
+`GrdmaPciTopoCheckOverride=1`, and `EnableResizableBar=1` values are actually
+loaded. If they are missing, the panel prints the suggested
+`/etc/modprobe.d/nvidia-p2p-override.conf` line and reminds that the NVIDIA
+module must be reloaded or the host rebooted before the file takes effect.
+
+For a deeper fabric sanity check, run:
+
+```bash
+python3 llm_decode_bench.py --p2pmark-only
+python3 llm_decode_bench.py --p2pmark --p2pmark-mode all --port 8000
+```
+
+The bundled `tools/p2pmark/llm_p2pmark` CUDA binary measures CUDA peer memcpy
+bandwidth, peer-distance topology behavior, ring bandwidth, all-to-all stress,
+dependent remote-read latency, and allreduce behavior across visible GPUs. The
+default allreduce sweep compares custom PCIe allreduce vs NCCL from 256 B to
+1 MiB, with winner and speedup ratio per size. Use
+`--p2pmark-allreduce-sizes-mb 1,2,4,8,16,32,64` for a larger MiB-only sweep.
+
+For single-file installs, `llm_decode_bench.py` includes a compressed Linux
+x86_64 CUDA/NCCL fallback helper. If the sidecar binary is missing, the script
+extracts it to `~/.cache/llm_decode_bench/bin/`. The fallback still depends on
+compatible runtime libraries (`libcudart.so.13` and `libnccl.so.2`). Build a
+local sidecar with `make -C tools/p2pmark` or pass `--p2pmark-bin` if the
+runtime does not match.
 
 ### Prefill Metrics
 

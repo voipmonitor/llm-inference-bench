@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.14 - 2026-05-10
+
+### Estonia profile live progress
+
+- Completion-token profile mode now updates while requests are still streaming instead of only when a request finishes.
+- The live view now shows scout status, queued/launched/active request counts, active stream elapsed time, estimated live tokens, estimated live tok/s, and latest answer text excerpts.
+- The prefill scout row is now rendered as prefix-cache/prefill measurement with prompt tokens, TTFT, and prefill tok/s instead of a misleading one-token completed answer.
+- Completion-token profile mode now includes the same live GPU/CPU hardware panel used by the normal decode dashboard when `nvidia-smi` is available.
+- The hardware panel is placed in the top-right of the completion-token live layout instead of between result tables.
+- `--test-profile estonia` now defaults to fixed `--profile-concurrency 30` and `--profile-runs 30` unless the user explicitly provides concurrency/runs/adaptive-level options.
+- Recent runs now include the final answer or output excerpt, not just `ok/no`.
+- `q` now performs a soft stop in completion-token profile mode and returns a partial final report from completed requests.
+- `--dcp-size` now also scales SGLang `max_total_num_tokens` when `/get_server_info` reports only the local KV cache budget.
+
+### P2P fabric diagnostics
+
+- Added bundled CUDA/NCCL fabric diagnostic source and binary target under `tools/p2pmark`.
+- Added `--p2pmark` and `--p2pmark-only` to measure CUDA peer memcpy and NCCL allreduce before inference and store the parsed result in JSON.
+- P2P diagnostic console output now includes peer-access matrix, P2P bandwidth matrix, per-GPU in/out summaries, peer-distance topology probe, single-writer fan-out, ring bandwidth, all-to-all fabric stress, remote-read latency, and all allreduce rows instead of only a compact one-line summary.
+- P2P diagnostic default allreduce sweep compares custom PCIe allreduce vs NCCL from 256 B to 1 MiB, with winner and ratio per size; larger MiB sweeps can be requested explicitly.
+- Startup now prints whether the NVIDIA P2P override is effectively loaded from `/proc/driver/nvidia/params`, and prints the suggested modprobe line when it is missing.
+- `llm_decode_bench.py` now embeds a compressed Linux x86_64 CUDA/NCCL `llm_p2pmark` fallback helper, so raw single-file installs can run `--p2pmark-only` when compatible CUDA/NCCL runtime libraries are present.
+
 ## 0.4.13 - 2026-05-09
 
 ### Repository transfer
