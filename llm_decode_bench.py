@@ -56,7 +56,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.15"
+VERSION = "0.4.16"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -8565,6 +8565,7 @@ async def run_one_cell(
     measurement_usage_tokens_start = 0  # OpenAI usage completion_tokens at measurement start
     measurement_gen_tokens_start = None  # vLLM generation_tokens counter at measurement start
     measurement_gen_tokens_end = None
+    measurement_gen_end_time = None
 
     while True:
         await asyncio.sleep(0.5)
@@ -8757,13 +8758,18 @@ async def run_one_cell(
         # Check duration (measured from after warmup completes)
         measure_elapsed = (now - measurement_start) if measurement_start else 0
         if measurement_start and measure_elapsed >= duration:
+            # Close the client-side measured window at the same timestamp used
+            # by the live display. Do not include the final Prometheus scrape in
+            # OpenAI stream throughput; otherwise final tables can under-report
+            # compared with the live cell value.
+            measurement_end = now
+            cancel_event.set()
             if engine == ENGINE_VLLM and measurement_gen_tokens_start is not None:
                 end_metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
                 measurement_gen_tokens_end = extract_metric(
                     end_metrics, metric_name(engine, "gen_tokens_total")
                 )
-                measurement_end = time.monotonic()
-            cancel_event.set()
+                measurement_gen_end_time = time.monotonic()
             break
 
         # Check skip key
@@ -8825,14 +8831,14 @@ async def run_one_cell(
         engine == ENGINE_VLLM
         and measurement_gen_tokens_start is not None
         and measurement_gen_tokens_end is not None
-        and measurement_end is not None
-        and measurement_end > measurement_start
+        and measurement_gen_end_time is not None
+        and measurement_gen_end_time > measurement_start
     ):
         exact_server_tokens = max(
             0,
             int(round(measurement_gen_tokens_end - measurement_gen_tokens_start)),
         )
-        exact_server_throughput = exact_server_tokens / (measurement_end - measurement_start)
+        exact_server_throughput = exact_server_tokens / (measurement_gen_end_time - measurement_start)
 
     server_gen_throughput = exact_server_throughput
     if server_gen_throughput == 0:

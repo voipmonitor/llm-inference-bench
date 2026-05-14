@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.16 - 2026-05-14
+
+### Sustained decode timing
+
+- Fixed duration-based vLLM cells where the final aggregate tok/s could be lower than the last live value because the final Prometheus scrape time was accidentally included in the OpenAI stream-usage measurement window.
+- The client-side measured window now closes exactly when `--duration` expires; server `/metrics` scraping remains a validation path and no longer extends the OpenAI throughput denominator.
+
 ## 0.4.15 - 2026-05-11
 
 ### AMD CPU fabric diagnostics
