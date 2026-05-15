@@ -56,7 +56,7 @@ from rich.text import Text
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.4.16"
+VERSION = "0.4.18"
 
 CHARS_PER_TOKEN = 4
 DEFAULT_CALIBRATION_CACHE = "/tmp/llm_decode_bench_token_calibration_cache.json"
@@ -3864,6 +3864,7 @@ class CellResult:
     request_count_target: int = 0
     warmup_request_count: int = 0
     measurement_seconds: float = 0.0
+    measurement_wall_seconds: float = 0.0
     client_output_tokens: int = 0
     server_output_tokens: int = 0
     aggregate_source: str = ""
@@ -7640,6 +7641,8 @@ async def stream_one_request(
     shared_completed_count: list = None,
     target_request_count: int = 0,
     shared_usage_token_count: list = None,
+    shared_usage_last_time: list = None,
+    shared_token_last_time: list = None,
 ) -> StreamResult:
     """Stream requests in a loop until cancel_event. When a request finishes
     (hits max_tokens or EOS), immediately start a new one to keep concurrency
@@ -7701,6 +7704,8 @@ async def stream_one_request(
                             usage_delta = max(0, usage_tokens - req_last_usage_tokens)
                             if usage_delta > 0:
                                 shared_usage_token_count[0] += usage_delta
+                                if shared_usage_last_time is not None:
+                                    shared_usage_last_time[0] = time.monotonic()
                             req_last_usage_tokens = max(req_last_usage_tokens, usage_tokens)
                     if usage and "prompt_tokens" in usage:
                         prompt_tokens = usage["prompt_tokens"]
@@ -7736,6 +7741,8 @@ async def stream_one_request(
                         total_chunks += 1
                         req_chunks += 1
                         shared_token_count[0] += 1
+                        if shared_token_last_time is not None:
+                            shared_token_last_time[0] = token_time
 
         except httpx.ReadTimeout:
             result.error = "ReadTimeout"
@@ -8031,6 +8038,8 @@ async def run_one_cell(
     shared_usage_token_count = [0]
     shared_active_streams = [0]  # how many streams have received first token
     shared_request_samples = []
+    shared_usage_last_time = [0.0]
+    shared_token_last_time = [0.0]
 
     # Fresh client per cell — avoids stale keepalive connections from previous cells
     cell_limits = httpx.Limits(
@@ -8527,7 +8536,9 @@ async def run_one_cell(
             stream_one_request(cell_client, url, payload, i, cancel_event,
                                shared_token_count, shared_active_streams,
                                shared_request_samples,
-                               shared_usage_token_count=shared_usage_token_count)
+                               shared_usage_token_count=shared_usage_token_count,
+                               shared_usage_last_time=shared_usage_last_time,
+                               shared_token_last_time=shared_token_last_time)
         )
         for i in range(concurrency)
     ]
@@ -8566,9 +8577,14 @@ async def run_one_cell(
     measurement_gen_tokens_start = None  # vLLM generation_tokens counter at measurement start
     measurement_gen_tokens_end = None
     measurement_gen_end_time = None
+    measurement_wall_end = None
 
     while True:
-        await asyncio.sleep(0.5)
+        sleep_for = 0.5
+        if measurement_start:
+            remaining = duration - (time.monotonic() - measurement_start)
+            sleep_for = 0.0 if remaining <= 0 else min(0.5, max(0.02, remaining))
+        await asyncio.sleep(sleep_for)
         now = time.monotonic()
         elapsed = now - state.cell_start
 
@@ -8738,13 +8754,24 @@ async def run_one_cell(
         # Sustained Decode live display prefers OpenAI stream usage. Prometheus
         # remains visible as server validation and for scheduler state.
         if measurement_start:
-            client_elapsed = now - measurement_start
             measurement_usage_tokens = shared_usage_token_count[0] - measurement_usage_tokens_start
             measurement_tokens = shared_token_count[0] - measurement_tokens_start
-            if client_elapsed > 0.5 and measurement_usage_tokens > 0:
-                state.cell_live_tps = measurement_usage_tokens / client_elapsed
-            elif client_elapsed > 0.5 and measurement_tokens > 0:
-                state.cell_live_tps = measurement_tokens / client_elapsed
+            usage_elapsed_end = (
+                shared_usage_last_time[0]
+                if measurement_usage_tokens > 0 and shared_usage_last_time[0] > measurement_start
+                else now
+            )
+            token_elapsed_end = (
+                shared_token_last_time[0]
+                if measurement_tokens > 0 and shared_token_last_time[0] > measurement_start
+                else now
+            )
+            usage_elapsed = usage_elapsed_end - measurement_start
+            token_elapsed = token_elapsed_end - measurement_start
+            if usage_elapsed > 0.5 and measurement_usage_tokens > 0:
+                state.cell_live_tps = measurement_usage_tokens / usage_elapsed
+            elif token_elapsed > 0.5 and measurement_tokens > 0:
+                state.cell_live_tps = measurement_tokens / token_elapsed
             elif state.srv_gen_throughput > 0:
                 state.cell_live_tps = state.srv_gen_throughput
             if warmup_done and state.cell_live_tps > 0:
@@ -8763,6 +8790,7 @@ async def run_one_cell(
             # OpenAI stream throughput; otherwise final tables can under-report
             # compared with the live cell value.
             measurement_end = now
+            measurement_wall_end = now
             cancel_event.set()
             if engine == ENGINE_VLLM and measurement_gen_tokens_start is not None:
                 end_metrics = await scrape_metrics(client, base_url) if state.metrics_available else {}
@@ -8844,19 +8872,44 @@ async def run_one_cell(
     if server_gen_throughput == 0:
         server_gen_throughput = median(gen_throughput_samples) if gen_throughput_samples else 0.0
 
-    measure_duration = (measurement_end - measurement_start) if (
+    measurement_wall_duration = (measurement_wall_end - measurement_start) if (
+        measurement_start and measurement_wall_end and measurement_wall_end > measurement_start
+    ) else ((measurement_end - measurement_start) if (
         measurement_start and measurement_end and measurement_end > measurement_start
-    ) else ((time.monotonic() - measurement_start) if measurement_start else wall_time)
+    ) else ((time.monotonic() - measurement_start) if measurement_start else wall_time))
     measurement_tokens = max(0, shared_token_count[0] - measurement_tokens_start)
     measurement_usage_tokens = max(0, shared_usage_token_count[0] - measurement_usage_tokens_start)
     aggregate_source = ""
-    if measure_duration > 0 and measurement_usage_tokens > 0:
+    usage_measure_end = (
+        shared_usage_last_time[0]
+        if measurement_usage_tokens > 0 and shared_usage_last_time[0] > measurement_start
+        else measurement_end
+    )
+    token_measure_end = (
+        shared_token_last_time[0]
+        if measurement_tokens > 0 and shared_token_last_time[0] > measurement_start
+        else measurement_end
+    )
+    usage_measure_duration = (
+        usage_measure_end - measurement_start
+        if measurement_start and usage_measure_end and usage_measure_end > measurement_start
+        else 0.0
+    )
+    token_measure_duration = (
+        token_measure_end - measurement_start
+        if measurement_start and token_measure_end and token_measure_end > measurement_start
+        else 0.0
+    )
+    if usage_measure_duration > 0 and measurement_usage_tokens > 0:
+        measure_duration = usage_measure_duration
         avg_gen_throughput = measurement_usage_tokens / measure_duration
         aggregate_source = "openai_continuous_usage"
-    elif measure_duration > 0 and measurement_tokens > 0:
+    elif token_measure_duration > 0 and measurement_tokens > 0:
+        measure_duration = token_measure_duration
         avg_gen_throughput = measurement_tokens / measure_duration
         aggregate_source = "openai_stream_chunks_fallback"
     else:
+        measure_duration = measurement_wall_duration
         avg_gen_throughput = server_gen_throughput
         aggregate_source = "prometheus_fallback" if server_gen_throughput > 0 else "none"
 
@@ -8911,6 +8964,7 @@ async def run_one_cell(
         context_tokens=context_tokens,
         benchmark_mode="duration",
         measurement_seconds=round(measure_duration, 6),
+        measurement_wall_seconds=round(measurement_wall_duration, 6),
         client_output_tokens=measurement_usage_tokens if measurement_usage_tokens > 0 else measurement_tokens,
         server_output_tokens=exact_server_tokens,
         aggregate_source=aggregate_source,
@@ -11087,6 +11141,28 @@ async def run_benchmark(args):
                 if _should_skip(ctx, conc):
                     state.results[(ctx, conc)] = -1
 
+    def _context_fits_model_limit(ctx: int) -> bool:
+        return not server_context_length or ctx + args.max_tokens <= server_context_length
+
+    def _select_decode_warmup_context() -> int:
+        """Pick the largest C=1 context that should be runnable right now."""
+        for ctx in sorted(set(context_lengths), reverse=True):
+            if ctx == 0:
+                return 0
+            if _context_fits_model_limit(ctx) and not _should_skip(ctx, 1):
+                return ctx
+        return 0
+
+    def _warmup_context_text(ctx: int) -> str:
+        if ctx <= 0:
+            return ""
+        cached = context_cache.get(ctx) or generate_padding_text(ctx)
+        measured_prefix = f"[BENCH_{run_id}_CTX_{ctx}] "
+        warmup_prefix = f"[WARMUP_{run_id}_DECODE_CTX_{ctx}] "
+        if cached.startswith(measured_prefix):
+            return warmup_prefix + cached[len(measured_prefix):]
+        return warmup_prefix + cached
+
     # Decode-context prefill is part of each decode context scout request. Only
     # standalone samples and scout-only extra contexts add independent tests.
     state.prefill_contexts = prefill_contexts
@@ -11607,6 +11683,10 @@ async def run_benchmark(args):
 
             # === Phase 2: Decode benchmark (cached prefill, pure decode speed) ===
             # Cache warming per context is handled by scout request in run_one_cell.
+            # Before the measured matrix, run one hidden C=1 decode warmup on the
+            # largest context that fits the currently known model/KV limits. This
+            # gets long-context JIT/CUDA graph/speculative paths out of the first
+            # measured cell without polluting measured prefix-cache keys.
             # Order: 1) first column (C=first, all ctx) — baseline
             #        2) first row (ctx=first, all C) — concurrency scaling
             #        3) rest row by row
@@ -11614,33 +11694,45 @@ async def run_benchmark(args):
             first_conc = concurrency_levels[0]
             first_ctx = context_lengths[0]
 
-            # Optional hidden decode warmup. The short probe above is enough for
-            # basic JIT compilation, but long-running speculative stacks can still
-            # under-report the first measured decode cell. This runs the first
-            # decode shape without recording it, then clears the transient TUI state.
+            # Hidden decode warmup. Duration 0 disables it explicitly.
             if args.decode_warmup_seconds > 0:
-                await run_one_cell(
-                    client=client,
-                    base_url=base_url,
-                    concurrency=first_conc,
-                    context_tokens=first_ctx,
-                    context_text=context_cache[first_ctx],
-                    duration=args.decode_warmup_seconds,
-                    max_tokens=args.max_tokens,
-                    model=args.model,
-                    state=state,
-                    live=live,
-                    engine=engine,
-                    auth_headers=auth_headers,
-                    ignore_eos=not args.respect_eos,
-                    request_count=0,
-                    warmup_request_count=0,
-                    cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
+                warmup_ctx = _select_decode_warmup_context()
+                warmup_conc = 1
+                setattr(args, "decode_warmup_context", warmup_ctx)
+                add_event(
+                    state,
+                    f"decode warmup start C={warmup_conc} ctx={format_context(warmup_ctx)} "
+                    f"{args.decode_warmup_seconds:g}s",
                 )
-                state.results.pop((first_ctx, first_conc), None)
-                state.errors.pop((first_ctx, first_conc), None)
-                state.queue_info.pop((first_ctx, first_conc), None)
+                saved_prefill_contexts = list(state.prefill_contexts)
+                state.prefill_contexts = []
+                try:
+                    await run_one_cell(
+                        client=client,
+                        base_url=base_url,
+                        concurrency=warmup_conc,
+                        context_tokens=warmup_ctx,
+                        context_text=_warmup_context_text(warmup_ctx),
+                        duration=args.decode_warmup_seconds,
+                        max_tokens=args.max_tokens,
+                        model=args.model,
+                        state=state,
+                        live=live,
+                        engine=engine,
+                        auth_headers=auth_headers,
+                        ignore_eos=not args.respect_eos,
+                        request_count=0,
+                        warmup_request_count=0,
+                        cell_warmup_timeout_seconds=args.cell_warmup_timeout_seconds,
+                    )
+                finally:
+                    state.prefill_contexts = saved_prefill_contexts
+                state.results.pop((warmup_ctx, warmup_conc), None)
+                state.errors.pop((warmup_ctx, warmup_conc), None)
+                state.queue_info.pop((warmup_ctx, warmup_conc), None)
+                state.client_info.pop((warmup_ctx, warmup_conc), None)
                 state.cell_running = False
+                add_event(state, f"decode warmup done C={warmup_conc} ctx={format_context(warmup_ctx)}")
                 live.update(build_display(state))
                 await asyncio.sleep(2.0)
 
@@ -12387,6 +12479,8 @@ def save_results(results: list, args, filepath: str, prefill_results: dict = Non
             "burst_warmup_request_count": getattr(args, "burst_warmup_request_count", 0),
             "burst_requests_per_concurrency": getattr(args, "burst_requests_per_concurrency", 5),
             "decode_warmup_seconds": getattr(args, "decode_warmup_seconds", 0),
+            "decode_warmup_context": getattr(args, "decode_warmup_context", 0),
+            "decode_warmup_concurrency": 1 if getattr(args, "decode_warmup_seconds", 0) > 0 else 0,
             "cell_warmup_timeout_seconds": getattr(args, "cell_warmup_timeout_seconds", 0),
             "cell_warmup_timeout_policy": "<=32k:60s,64k:120s,>=128k:180s when override is 0",
             "show_capacity_limited_values": getattr(args, "show_capacity_limited_values", False),
@@ -12742,9 +12836,10 @@ def parse_args():
         help="Max tokens to generate per request (default: 2048)"
     )
     parser.add_argument(
-        "--decode-warmup-seconds", type=float, default=0.0,
-        help="Hidden decode warmup duration before measured decode cells. "
-             "Use 20 for short exact decode matrices on speculative stacks."
+        "--decode-warmup-seconds", type=float, default=3.0,
+        help="Hidden C=1 decode warmup duration before measured decode cells. "
+             "The warmup uses the largest requested context that fits current "
+             "model/KV limits. Set 0 to disable. (default: 3)"
     )
     parser.add_argument(
         "--cell-warmup-timeout-seconds", type=float, default=0.0,
@@ -13194,6 +13289,7 @@ def main():
         f"Decode concurrency: {concurrency_levels}\n"
         f"Decode contexts: {[format_context(c) for c in context_lengths]}\n"
         f"{decode_mode} | Max tokens: {args.max_tokens}\n"
+        f"Pre-decode warmup: {'disabled' if args.decode_warmup_seconds <= 0 else f'C=1 max-runnable context for {args.decode_warmup_seconds:g}s'}\n"
         f"{prefill_label} | Sustained decode: {decode_count} cells{phase3}",
         title=render_title("Configuration"),
         box=PANEL_BOX,

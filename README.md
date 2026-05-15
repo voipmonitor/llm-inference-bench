@@ -110,6 +110,7 @@ python3 llm_decode_bench.py --amd-fabric-only
 | `--contexts` | `0,16384,32768,65536,131072` | Comma-separated context lengths (tokens) |
 | `--max-tokens` | `2048` | Max tokens to generate per request |
 | `--duration` | `30` | Duration per decode test cell (seconds) |
+| `--decode-warmup-seconds` | `3` | Hidden pre-measurement warmup at `C=1` using the largest requested context that fits current model/KV limits. Set `0` to disable |
 | `--prefill-contexts` | `8k,64k,128k` | Extra scout prefill contexts in default mode; standalone profile contexts with `--standalone-prefill` |
 | `--prefill-metric` | `client` | Prefill headline source: `client`, `auto`, or `prometheus`. `auto` adds Prometheus validation when available |
 | `--standalone-prefill` | `false` | Run the old repeated cold-prefill profile before decode |
@@ -179,9 +180,11 @@ throughput; they stress different parts of the engine.
 
 ### Sustained Decode
 
-Sustained Decode is the default duration-based benchmark. Each matrix cell runs
-for `--duration` seconds after warmup and keeps the requested concurrency
-saturated by restarting streams as they finish.
+Sustained Decode is the default duration-based benchmark. Before the measured
+matrix starts, the default run performs one hidden `C=1` warmup at the largest
+requested context that fits the current model/KV limits. Each matrix cell then
+runs for `--duration` seconds after its own readiness warmup and keeps the
+requested concurrency saturated by restarting streams as they finish.
 
 Aggregate decode throughput uses OpenAI stream usage by default. For local
 vLLM/SGLang this is exact when `continuous_usage_stats` is supported, because

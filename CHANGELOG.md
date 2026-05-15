@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.18 - 2026-05-15
+
+### Decode warmup
+
+- Standard decode runs now perform a hidden pre-measurement warmup at `C=1` using the largest requested context that fits the current model/KV limits.
+- The warmup uses a separate prompt prefix so it does not populate the measured prefix-cache key or get recorded as a prefill result.
+- `--decode-warmup-seconds` now defaults to `3`; set it to `0` to disable the hidden warmup.
+
+## 0.4.17 - 2026-05-14
+
+### Sustained decode timing
+
+- Fixed duration-based Sustained Decode so the final matrix uses the same observed OpenAI stream-usage window as the live display.
+- JSON now includes `measurement_wall_seconds` separately from `measurement_seconds`, making the requested wall window visible without diluting tok/s with the post-token cancel/scrape tail.
+
 ## 0.4.16 - 2026-05-14
 
 ### Sustained decode timing
